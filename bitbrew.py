@@ -160,6 +160,33 @@ def _expand_pattern(pattern: str, chars: str) -> Generator[str, None, None]:
         yield "".join(parts)
 
 
+_REDOS_PATTERN = re.compile(
+    r"""
+    \(             # opening group
+    [^)]*          # group contents
+    [+*]\??        # inner quantifier (+ or * with optional ?)
+    [^)]*          # more group contents
+    \)             # closing group
+    [+*]\??        # outer quantifier (+ or * with optional ?)
+    """,
+    re.VERBOSE,
+)
+
+
+def _check_regex_safety(pattern: str) -> Optional[str]:
+    """Check a regex pattern for common ReDoS indicators.
+
+    Returns an error message if the pattern looks dangerous, or None if it
+    appears safe.
+    """
+    if _REDOS_PATTERN.search(pattern):
+        return (
+            "pattern contains nested quantifiers which can cause catastrophic "
+            "backtracking (ReDoS)"
+        )
+    return None
+
+
 def _apply_filters(
     words: Iterable[str],
     min_len: Optional[int],
@@ -300,6 +327,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Validate regex filter
     regex = None
     if args.regex_filter:
+        safety_err = _check_regex_safety(args.regex_filter)
+        if safety_err:
+            print(f"Error: unsafe regex '{args.regex_filter}': {safety_err}", file=sys.stderr)
+            return 1
         try:
             regex = re.compile(args.regex_filter)
         except re.error as e:

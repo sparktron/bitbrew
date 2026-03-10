@@ -14,6 +14,7 @@ import pytest
 
 from bitbrew import (
     _apply_filters,
+    _check_regex_safety,
     _chunked_write,
     _deduplicated,
     _expand_pattern,
@@ -120,6 +121,26 @@ class TestFilters:
         pattern = re.compile(r"^c")
         result = list(_apply_filters(words, min_len=None, max_len=None, regex=pattern))
         assert result == ["cat", "car"]
+
+
+class TestCheckRegexSafety:
+    def test_safe_patterns_pass(self) -> None:
+        safe = [r"^abc$", r"\d+", r"[a-z]+", r"(foo|bar)", r"a{2,5}"]
+        for pat in safe:
+            assert _check_regex_safety(pat) is None, f"should be safe: {pat}"
+
+    def test_nested_quantifiers_rejected(self) -> None:
+        dangerous = [r"(a+)+", r"(a+)*", r"(a*)+", r"(a*)*", r"(x+)+?", r"([a-z]+)*"]
+        for pat in dangerous:
+            result = _check_regex_safety(pat)
+            assert result is not None, f"should be rejected: {pat}"
+            assert "nested quantifiers" in result
+
+    def test_cli_rejects_redos_pattern(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ret = main(["-p", "a*", "--charset", "ab", "--filter", "(a+)+$"])
+        assert ret == 1
+        stderr = capsys.readouterr().err
+        assert "unsafe regex" in stderr
 
 
 class TestDeduplication:
