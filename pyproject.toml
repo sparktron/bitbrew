@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bitbrew"
+version = "0.1.0"
+description = "A CLI tool that generates wordlists by expanding patterns with wildcard substitution."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+progress = ["tqdm"]
+dev = ["pytest"]
+
+[project.scripts]
+bitbrew = "bitbrew:main"
+
+[tool.setuptools]
+py-modules = ["bitbrew"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
