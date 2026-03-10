@@ -17,6 +17,7 @@ Usage as a library:
 
 import argparse
 import gzip
+import io
 import itertools
 import os
 import re
@@ -62,6 +63,9 @@ def resolve_charset(spec: str) -> str:
     return "".join(result)
 
 
+_MAX_ESTIMATE = 10**15  # cap to prevent unbounded memory/time
+
+
 def estimate_count(pattern: str, charset_len: int) -> int:
     """Estimate the total number of words a pattern will generate.
 
@@ -70,7 +74,7 @@ def estimate_count(pattern: str, charset_len: int) -> int:
         charset_len: Number of characters in the active charset.
 
     Returns:
-        Estimated word count.
+        Estimated word count (capped at _MAX_ESTIMATE).
     """
     count = 1
     for ch in pattern:
@@ -78,6 +82,8 @@ def estimate_count(pattern: str, charset_len: int) -> int:
             count *= charset_len
         elif ch == "?":
             count *= (charset_len + 1)  # charset options + empty
+        if count > _MAX_ESTIMATE:
+            return _MAX_ESTIMATE
     return count
 
 
@@ -111,18 +117,15 @@ def _expand_pattern(pattern: str, chars: str) -> Generator[str, None, None]:
     wildcards = []
     template_parts = []
     i = 0
-    pos = 0
     while i < len(pattern):
         ch = pattern[i]
         if ch == "*":
             template_parts.append(None)  # placeholder
             wildcards.append(list(chars))
-            pos += 1
             i += 1
         elif ch == "?":
             template_parts.append(None)
             wildcards.append([""] + list(chars))  # empty string = skip
-            pos += 1
             i += 1
         else:
             # Literal character
@@ -162,12 +165,16 @@ def _expand_pattern(pattern: str, chars: str) -> Generator[str, None, None]:
 
 _REDOS_PATTERN = re.compile(
     r"""
-    \(             # opening group
-    [^)]*          # group contents
-    [+*]\??        # inner quantifier (+ or * with optional ?)
-    [^)]*          # more group contents
-    \)             # closing group
-    [+*]\??        # outer quantifier (+ or * with optional ?)
+    \(               # opening group
+    (?:[^()]*         # group contents (non-nested)
+       |\[.*?\]       # or character classes
+    )*
+    [+*]\??          # inner quantifier (+ or * with optional ?)
+    (?:[^()]*         # more group contents
+       |\[.*?\]       # or character classes
+    )*
+    \)               # closing group
+    [+*]\??          # outer quantifier (+ or * with optional ?)
     """,
     re.VERBOSE,
 )
@@ -232,7 +239,7 @@ def _deduplicated(words: Iterable[str]) -> Generator[str, None, None]:
 
 def _chunked_write(
     words: Iterable[str],
-    file_obj: "gzip.GzipFile | object",
+    file_obj: "gzip.GzipFile | io.TextIOBase | io.StringIO",
     chunk_size: int,
     progress: Optional[object] = None,
 ) -> int:
@@ -240,27 +247,28 @@ def _chunked_write(
 
     Args:
         words: Word iterable.
-        file_obj: File object to write to (text or gzip).
+        file_obj: File object to write to (text-mode or binary gzip).
         chunk_size: Number of words per chunk.
         progress: Optional tqdm progress bar to update.
 
     Returns:
         Total number of words written.
     """
+    is_binary = isinstance(file_obj, gzip.GzipFile)
     total = 0
     buf: list[str] = []
     for word in words:
         buf.append(word)
         if len(buf) >= chunk_size:
             data = "\n".join(buf) + "\n"
-            file_obj.write(data.encode() if isinstance(file_obj, gzip.GzipFile) else data)
+            file_obj.write(data.encode() if is_binary else data)
             if progress is not None:
                 progress.update(len(buf))
             total += len(buf)
             buf.clear()
     if buf:
         data = "\n".join(buf) + "\n"
-        file_obj.write(data.encode() if isinstance(file_obj, gzip.GzipFile) else data)
+        file_obj.write(data.encode() if is_binary else data)
         if progress is not None:
             progress.update(len(buf))
         total += len(buf)
@@ -379,6 +387,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     if output_path and output_path.endswith(".gz"):
         use_compress = True
 
+    if output_path:
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.isdir(output_dir):
+            print(
+                f"Error: output directory '{output_dir}' does not exist.",
+                file=sys.stderr,
+            )
+            return 1
+
     if output_path and os.path.exists(output_path) and not args.overwrite:
         print(
             f"Error: output file '{output_path}' already exists. Use --overwrite to replace.",
@@ -420,7 +437,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 pass
 
             if use_compress:
-                with gzip.open(output_path, "wt", encoding="utf-8") as f:
+                with gzip.open(output_path, "wb") as f:
                     written = _chunked_write(words, f, args.chunk_size, progress)
             else:
                 with open(output_path, "w", encoding="utf-8") as f:
@@ -440,6 +457,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                 os.remove(output_path)
             print("\nInterrupted. Partial output file removed.", file=sys.stderr)
             return 130
+        except OSError as e:
+            print(f"Error: could not write to '{output_path}': {e}", file=sys.stderr)
+            return 1
         finally:
             signal.signal(signal.SIGINT, old_handler)
     else:
