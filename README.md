@@ -11,14 +11,23 @@ Requires Python 3.10+.
 git clone https://github.com/sparktron/bitbrew.git
 cd bitbrew
 
-# Install optional dependencies (progress bar)
-pip install tqdm
+# Install in development mode
+pip install -e .
 
-# Install test dependencies
-pip install pytest
+# With optional progress bar
+pip install -e ".[progress]"
+
+# With dev dependencies (pytest)
+pip install -e ".[dev]"
 ```
 
-No other installation is needed — `bitbrew.py` is a standalone script with no required third-party dependencies.
+After installation the `bitbrew` command is available on your PATH:
+
+```bash
+bitbrew -p "***" --charset digits
+```
+
+You can also run it directly as a standalone script with no install required — `bitbrew.py` has no required third-party dependencies.
 
 ## Usage
 
@@ -26,16 +35,16 @@ No other installation is needed — `bitbrew.py` is a standalone script with no 
 
 ```bash
 # Generate all 3-letter lowercase words
-python bitbrew.py -p "***"
+bitbrew -p "***"
 
 # Generate words like "pass0" through "pass9"
-python bitbrew.py -p "pass*" --charset digits
+bitbrew -p "pass*" --charset digits
 
 # Multiple charsets: lowercase + digits
-python bitbrew.py -p "a**" --charset "lower,digits"
+bitbrew -p "a**" --charset "lower,digits"
 
 # Custom character set
-python bitbrew.py -p "**" --charset "abc123"
+bitbrew -p "**" --charset "abc123"
 ```
 
 ### Pattern syntax
@@ -49,7 +58,7 @@ Literal characters are preserved as-is. Multiple wildcards produce the full cart
 
 ```bash
 # ? generates optional positions: "ab" and "axb"
-python bitbrew.py -p "a?b" --charset "x"
+bitbrew -p "a?b" --charset "x"
 ```
 
 ### Charsets
@@ -70,23 +79,23 @@ Or pass a raw string: `--charset "aeiou0123"`
 
 ```bash
 # Write to a file
-python bitbrew.py -p "***" --charset digits -o words.txt
+bitbrew -p "***" --charset digits -o words.txt
 
 # Compressed output (auto-detected from .gz extension)
-python bitbrew.py -p "***" --charset digits -o words.txt.gz
+bitbrew -p "***" --charset digits -o words.txt.gz
 
 # Or use --compress flag explicitly
-python bitbrew.py -p "***" --charset digits -o words.txt --compress
+bitbrew -p "***" --charset digits -o words.txt --compress
 ```
 
 ### Filtering
 
 ```bash
 # Length filters
-python bitbrew.py -p "a?b?c" --charset digits --min-len 4 --max-len 5
+bitbrew -p "a?b?c" --charset digits --min-len 4 --max-len 5
 
 # Regex filter: only words starting with "a" and ending with "9"
-python bitbrew.py -p "***" --charset "lower,digits" --filter "^a.*9$"
+bitbrew -p "***" --charset "lower,digits" --filter "^a.*9$"
 ```
 
 ### Multiple patterns
@@ -94,7 +103,7 @@ python bitbrew.py -p "***" --charset "lower,digits" --filter "^a.*9$"
 Use `-p` multiple times. Results are automatically deduplicated:
 
 ```bash
-python bitbrew.py -p "admin*" -p "root*" --charset digits -o wordlist.txt
+bitbrew -p "admin*" -p "root*" --charset digits -o wordlist.txt
 ```
 
 ### Count mode
@@ -102,7 +111,7 @@ python bitbrew.py -p "admin*" -p "root*" --charset digits -o wordlist.txt
 Preview how many words a pattern generates without outputting them:
 
 ```bash
-python bitbrew.py -p "****" --charset lower --count
+bitbrew -p "****" --charset lower --count
 # Output: 456976
 ```
 
@@ -111,13 +120,13 @@ python bitbrew.py -p "****" --charset lower --count
 Generating more than 10 million combinations requires `--force`:
 
 ```bash
-python bitbrew.py -p "******" --charset lower --force -o big.txt
+bitbrew -p "******" --charset lower --force -o big.txt
 ```
 
 Use `--chunk-size` to control the streaming buffer (default: 10,000 words):
 
 ```bash
-python bitbrew.py -p "******" --charset lower --force -o big.txt --chunk-size 50000
+bitbrew -p "******" --charset lower --force -o big.txt --chunk-size 50000
 ```
 
 ### Safety flags
@@ -141,10 +150,10 @@ for word in generate_wordlist("pass**", "digits"):
 ## CLI reference
 
 ```
-usage: bitbrew.py [-h] -p PATTERN [-o OUTPUT] [--charset CHARSET]
-                             [--min-len MIN_LEN] [--max-len MAX_LEN]
-                             [--filter REGEX] [--count] [--compress]
-                             [--chunk-size CHUNK_SIZE] [--force] [--overwrite]
+usage: bitbrew [-h] -p PATTERN [-o OUTPUT] [--charset CHARSET]
+               [--min-len MIN_LEN] [--max-len MAX_LEN]
+               [--filter REGEX] [--count] [--compress]
+               [--chunk-size CHUNK_SIZE] [--force] [--overwrite]
 ```
 
 | Flag | Description |
