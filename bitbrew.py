@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wordlist generator CLI tool.
+"""bitbrew — pattern-based wordlist generator CLI tool.
 
 Generates wordlists from patterns using wildcard substitution with support for
 multiple charsets, filtering, streaming output, and compression.
@@ -10,7 +10,7 @@ Pattern syntax:
     Literal characters are preserved as-is
 
 Usage as a library:
-    from wordlist_generator import generate_wordlist
+    from bitbrew import generate_wordlist
     for word in generate_wordlist("pass*", "digits"):
         print(word)
 """
