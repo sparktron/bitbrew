@@ -201,3 +201,27 @@ class TestCLI:
         assert ret == 0
         stderr = capsys.readouterr().err
         assert "no wildcards" in stderr
+
+    def test_chunk_size_zero(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ret = main(["-p", "a*", "--charset", "xy", "--chunk-size", "0"])
+        assert ret == 1
+        stderr = capsys.readouterr().err
+        assert "--chunk-size must be greater than 0" in stderr
+
+    def test_chunk_size_negative(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ret = main(["-p", "a*", "--charset", "xy", "--chunk-size", "-5"])
+        assert ret == 1
+        stderr = capsys.readouterr().err
+        assert "--chunk-size must be greater than 0" in stderr
+
+    def test_min_len_greater_than_max_len(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ret = main(["-p", "a*", "--charset", "xy", "--min-len", "5", "--max-len", "3"])
+        assert ret == 1
+        stderr = capsys.readouterr().err
+        assert "--min-len (5) is greater than --max-len (3)" in stderr
+
+    def test_empty_charset(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ret = main(["-p", "a*", "--charset", ""])
+        assert ret == 1
+        stderr = capsys.readouterr().err
+        assert "charset is empty" in stderr
