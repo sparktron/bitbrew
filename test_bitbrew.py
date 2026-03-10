@@ -1,4 +1,4 @@
-"""Tests for wordlist_generator.py."""
+"""Tests for bitbrew.py."""
 
 import gzip
 import os
@@ -7,7 +7,7 @@ import types
 
 import pytest
 
-from wordlist_generator import (
+from bitbrew import (
     _apply_filters,
     _deduplicated,
     _expand_pattern,
