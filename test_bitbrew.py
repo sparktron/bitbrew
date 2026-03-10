@@ -13,6 +13,7 @@ from unittest import mock
 import pytest
 
 from bitbrew import (
+    _MAX_ESTIMATE,
     _apply_filters,
     _check_regex_safety,
     _chunked_write,
@@ -322,19 +323,23 @@ class TestGzipCorruptionAndPermissionErrors:
             with gzip.open(gz_path, "rt") as f:
                 f.read()
 
-    def test_write_permission_error(self, tmp_path: "os.PathLike[str]") -> None:
-        """Writing to an unwritable path should propagate PermissionError."""
+    def test_write_permission_error(self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]") -> None:
+        """Writing to an unwritable path should return 1 with an error message."""
         outfile = str(tmp_path / "words.txt")
         with mock.patch("builtins.open", side_effect=PermissionError("Permission denied")):
-            with pytest.raises(PermissionError):
-                main(["-p", "a*", "--charset", "xy", "-o", outfile])
+            ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
+        assert ret == 1
+        stderr = capsys.readouterr().err
+        assert "could not write" in stderr
 
-    def test_gz_write_error(self, tmp_path: "os.PathLike[str]") -> None:
-        """Gzip open failure should propagate the error."""
+    def test_gz_write_error(self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]") -> None:
+        """Gzip open failure should return 1 with an error message."""
         outfile = str(tmp_path / "words.gz")
         with mock.patch("gzip.open", side_effect=OSError("disk full")):
-            with pytest.raises(OSError, match="disk full"):
-                main(["-p", "a*", "--charset", "xy", "-o", outfile])
+            ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
+        assert ret == 1
+        stderr = capsys.readouterr().err
+        assert "could not write" in stderr
 
 
 class TestInterruptCleanup:
@@ -538,3 +543,44 @@ class TestAdditionalEdgeCases:
         open(outfile, "w").close()
         ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
         assert ret == 1
+
+
+class TestAuditFixes:
+    """Tests for issues discovered during the codebase audit."""
+
+    def test_output_dir_does_not_exist(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Writing to a non-existent directory should return a clear error."""
+        ret = main(["-p", "a*", "--charset", "xy", "-o", "/no/such/dir/words.txt"])
+        assert ret == 1
+        stderr = capsys.readouterr().err
+        assert "directory" in stderr and "does not exist" in stderr
+
+    def test_oserror_during_write(self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]") -> None:
+        """OSError during file write should return 1 with a message, not crash."""
+        outfile = str(tmp_path / "words.txt")
+        with mock.patch("builtins.open", side_effect=OSError("disk full")):
+            ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
+        assert ret == 1
+        stderr = capsys.readouterr().err
+        assert "could not write" in stderr
+
+    def test_estimate_count_capped(self) -> None:
+        """estimate_count should cap at _MAX_ESTIMATE for huge patterns."""
+        # 70^50 is astronomically large
+        result = estimate_count("*" * 50, 70)
+        assert result == _MAX_ESTIMATE
+
+    def test_redos_with_char_class(self) -> None:
+        """ReDoS checker should catch nested quantifiers with character classes."""
+        result = _check_regex_safety(r"([a-z]+)+")
+        assert result is not None
+        assert "nested quantifiers" in result
+
+    def test_gzip_binary_mode_write(self, tmp_path: "os.PathLike[str]") -> None:
+        """gzip output should produce valid gzip data via binary-mode write."""
+        outfile = str(tmp_path / "words.gz")
+        ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
+        assert ret == 0
+        with gzip.open(outfile, "rt") as f:
+            content = f.read().strip().split("\n")
+        assert sorted(content) == ["ax", "ay"]
