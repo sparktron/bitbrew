@@ -306,7 +306,25 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"Error: invalid regex '{args.regex_filter}': {e}", file=sys.stderr)
             return 1
 
+    # Validate chunk-size
+    if args.chunk_size <= 0:
+        print("Error: --chunk-size must be greater than 0.", file=sys.stderr)
+        return 1
+
     charset = resolve_charset(args.charset)
+
+    # Validate charset is not empty
+    if not charset:
+        print("Error: resolved charset is empty. Provide a non-empty --charset value.", file=sys.stderr)
+        return 1
+
+    # Validate min-len / max-len relationship
+    if args.min_len is not None and args.max_len is not None and args.min_len > args.max_len:
+        print(
+            f"Error: --min-len ({args.min_len}) is greater than --max-len ({args.max_len}).",
+            file=sys.stderr,
+        )
+        return 1
 
     # Estimate total count and warn
     total_estimate = 0
