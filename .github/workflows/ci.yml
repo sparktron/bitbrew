@@ -35,9 +35,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install ruff
-        run: pip install ruff
+      - name: Install linters
+        run: pip install ruff mypy
       - name: Lint
         run: ruff check .
-      - name: Check formatting of import order
-        run: ruff check --select I .
+      - name: Type-check
+        run: mypy

@@ -7,6 +7,7 @@ multiple charsets, filtering, streaming output, and compression.
 Pattern syntax:
     * — matches exactly one character from the active charset
     ? — optional: matches zero or one character (produces two variants)
+    \\ — escapes the next character, so "\\*" is a literal asterisk
     Literal characters are preserved as-is
 
 Usage as a library:
@@ -17,16 +18,38 @@ Usage as a library:
 
 import argparse
 import contextlib
+import dataclasses
 import gzip
 import io
 import itertools
+import math
 import os
 import re
 import signal
 import sys
 import time
-from collections.abc import Callable, Generator, Iterable
-from typing import Optional
+from collections.abc import Callable, Generator, Iterable, Iterator
+from typing import Optional, Protocol
+
+__version__ = "0.1.0"
+
+
+class _ProgressBar(Protocol):
+    """The slice of the tqdm API bitbrew uses."""
+
+    def update(self, n: int) -> None:
+        """Advance the bar by n items."""
+
+    def close(self) -> None:
+        """Finalise the bar. Must tolerate being called twice."""
+
+
+class _CliError(Exception):
+    """A user-facing argument or environment problem.
+
+    Raised by option resolution and turned into a message plus exit code 1 by
+    main(), so validation code does not repeat print-and-return at every check.
+    """
 
 CHARSETS = {
     "lower": "abcdefghijklmnopqrstuvwxyz",
@@ -56,14 +79,50 @@ def resolve_charset(spec: str) -> str:
         else:
             # Treat as raw characters
             chars += part
-    # Deduplicate while preserving order
+    return _dedupe_chars(chars)
+
+
+def _dedupe_chars(chars: str) -> str:
+    """Remove duplicate characters, preserving first-appearance order.
+
+    Args:
+        chars: Raw character sequence.
+
+    Returns:
+        The deduplicated character string.
+    """
     seen: set[str] = set()
     result = []
-    for c in chars:
-        if c not in seen:
-            seen.add(c)
-            result.append(c)
+    for char in chars:
+        if char not in seen:
+            seen.add(char)
+            result.append(char)
     return "".join(result)
+
+
+def load_charset_file(path: str) -> str:
+    """Read a charset verbatim from a file.
+
+    Unlike --charset, nothing is split or stripped, so commas and spaces can be
+    part of the charset. A single trailing newline is ignored, since almost
+    every editor adds one.
+
+    Args:
+        path: File to read.
+
+    Returns:
+        The deduplicated character string.
+
+    Raises:
+        OSError: If the file cannot be read.
+    """
+    with open(path, encoding="utf-8") as handle:
+        data = handle.read()
+    if data.endswith("\r\n"):
+        data = data[:-2]
+    elif data.endswith("\n"):
+        data = data[:-1]
+    return _dedupe_chars(data)
 
 
 _MAX_ESTIMATE = 10**15  # cap to prevent unbounded memory/time
@@ -80,13 +139,15 @@ def estimate_count(pattern: str, charset_len: int) -> int:
 
     Returns:
         Estimated word count (capped at _MAX_ESTIMATE).
+
+    Raises:
+        ValueError: If the pattern ends with a dangling backslash.
     """
+    _, kinds = _parse_pattern(pattern)
     count = 1
-    for ch in pattern:
-        if ch == "*":
-            count *= charset_len
-        elif ch == "?":
-            count *= (charset_len + 1)  # charset options + empty
+    for kind in kinds:
+        # "?" has one extra option: matching nothing at all.
+        count *= charset_len if kind == "*" else charset_len + 1
         if count > _MAX_ESTIMATE:
             return _MAX_ESTIMATE
     return count
@@ -105,6 +166,53 @@ def generate_wordlist(pattern: str, charset: str = "lower") -> Generator[str, No
     yield from _expand_pattern(pattern, resolve_charset(charset))
 
 
+def _parse_pattern(pattern: str) -> tuple[list[str | int], list[str]]:
+    """Split a pattern into literal runs and wildcard slots.
+
+    A backslash escapes the following character, so "\\*" is a literal asterisk
+    rather than a wildcard. Consecutive literals are merged into one segment so
+    the expansion loop does less work per generated word.
+
+    Args:
+        pattern: The pattern string.
+
+    Returns:
+        (segments, kinds). segments mixes literal strings with integer indices
+        into kinds; kinds[i] is "*" or "?" for the i-th wildcard.
+
+    Raises:
+        ValueError: If the pattern ends with a dangling backslash.
+    """
+    segments: list[str | int] = []
+    kinds: list[str] = []
+    literal: list[str] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\":
+            if index + 1 >= len(pattern):
+                raise ValueError(
+                    "pattern ends with a dangling backslash; "
+                    "write '\\\\' for a literal backslash"
+                )
+            literal.append(pattern[index + 1])
+            index += 2
+            continue
+        if char in "*?":
+            if literal:
+                segments.append("".join(literal))
+                literal.clear()
+            segments.append(len(kinds))
+            kinds.append(char)
+            index += 1
+            continue
+        literal.append(char)
+        index += 1
+    if literal:
+        segments.append("".join(literal))
+    return segments, kinds
+
+
 def _expand_pattern(pattern: str, chars: str) -> Generator[str, None, None]:
     """Expand a pattern into all matching words.
 
@@ -114,56 +222,24 @@ def _expand_pattern(pattern: str, chars: str) -> Generator[str, None, None]:
 
     Yields:
         Generated words.
-    """
-    # Parse pattern into segments: each segment is either a literal string
-    # or a wildcard descriptor
-    wildcards = []
-    template_parts = []
-    i = 0
-    while i < len(pattern):
-        ch = pattern[i]
-        if ch == "*":
-            template_parts.append(None)  # placeholder
-            wildcards.append(list(chars))
-            i += 1
-        elif ch == "?":
-            template_parts.append(None)
-            wildcards.append([""] + list(chars))  # empty string = skip
-            i += 1
-        else:
-            # Literal character
-            template_parts.append(ch)
-            i += 1
 
-    if not wildcards:
-        # No wildcards — yield the literal pattern
-        yield pattern
+    Raises:
+        ValueError: If the pattern ends with a dangling backslash.
+    """
+    segments, kinds = _parse_pattern(pattern)
+
+    if not kinds:
+        # No wildcards — yield the pattern's literal text, escapes resolved.
+        yield "".join(seg for seg in segments if isinstance(seg, str))
         return
 
-    # Build template: merge consecutive literals
-    segments: list[str | int] = []  # str = literal, int = wildcard index
-    wc_idx = 0
-    literal_buf = ""
-    for part in template_parts:
-        if part is None:
-            if literal_buf:
-                segments.append(literal_buf)
-                literal_buf = ""
-            segments.append(wc_idx)
-            wc_idx += 1
-        else:
-            literal_buf += part
-    if literal_buf:
-        segments.append(literal_buf)
+    # "?" also offers the empty string, which is how it matches zero characters.
+    wildcards = [list(chars) if kind == "*" else ["", *chars] for kind in kinds]
 
     for combo in itertools.product(*wildcards):
-        parts = []
-        for seg in segments:
-            if isinstance(seg, int):
-                parts.append(combo[seg])
-            else:
-                parts.append(seg)
-        yield "".join(parts)
+        yield "".join(
+            combo[seg] if isinstance(seg, int) else seg for seg in segments
+        )
 
 
 _REDOS_PATTERN = re.compile(
@@ -312,6 +388,33 @@ def _deduplicated(words: Iterable[str]) -> Generator[str, None, None]:
             yield word
 
 
+def _text_writer(
+    file_obj: "gzip.GzipFile | io.TextIOBase | io.StringIO",
+) -> Callable[[str], None]:
+    """Adapt a text-mode or binary-gzip destination to one str-writing call.
+
+    Resolving the text/binary question once, here, keeps it out of the write
+    loop and lets the type checker see that each branch writes the right type.
+
+    Args:
+        file_obj: The destination file object.
+
+    Returns:
+        A function that writes a string to file_obj.
+    """
+    if isinstance(file_obj, gzip.GzipFile):
+
+        def write_binary(data: str) -> None:
+            file_obj.write(data.encode())
+
+        return write_binary
+
+    def write_text(data: str) -> None:
+        file_obj.write(data)
+
+    return write_text
+
+
 _STOP_CHECK_INTERVAL = 10_000  # words between should_stop() polls
 
 
@@ -319,7 +422,7 @@ def _chunked_write(
     words: Iterable[str],
     file_obj: "gzip.GzipFile | io.TextIOBase | io.StringIO",
     chunk_size: int,
-    progress: object | None = None,
+    progress: _ProgressBar | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> int:
     """Write words to a file in chunks.
@@ -339,14 +442,13 @@ def _chunked_write(
     Raises:
         KeyboardInterrupt: If should_stop() returns True mid-write.
     """
-    is_binary = isinstance(file_obj, gzip.GzipFile)
+    write = _text_writer(file_obj)
     total = 0
     buf: list[str] = []
 
     def flush() -> None:
         nonlocal total
-        data = "\n".join(buf) + "\n"
-        file_obj.write(data.encode() if is_binary else data)
+        write("\n".join(buf) + "\n")
         if progress is not None:
             progress.update(len(buf))
         total += len(buf)
@@ -388,7 +490,7 @@ def _needs_dedup(patterns: list[str]) -> bool:
     """
     if len(patterns) > 1:
         return True
-    return "?" in patterns[0]
+    return "?" in _parse_pattern(patterns[0])[1]
 
 
 def _human_bytes(size: float) -> str:
@@ -417,6 +519,166 @@ def _remove_if_exists(path: str) -> None:
         os.remove(path)
 
 
+_FORCE_THRESHOLD = 10_000_000  # combinations above which --force is required
+_BLOOM_MAX_BYTES = 1 << 31  # 2 GiB ceiling on the approximate-dedup filter
+
+
+class _BloomFilter:
+    """Fixed-memory approximate set membership.
+
+    Exact deduplication costs memory proportional to the output. A Bloom filter
+    trades a small, quantified false-positive rate for memory that does not grow
+    with the number of words. A false positive here means a word is wrongly
+    judged already-seen and dropped, so this is never the default.
+    """
+
+    def __init__(self, capacity: int, error_rate: float, max_bytes: int) -> None:
+        """Size a filter for the expected number of items.
+
+        Args:
+            capacity: Expected number of distinct items.
+            error_rate: Target false-positive rate at that capacity.
+            max_bytes: Hard ceiling on memory; the achieved rate degrades if the
+                ideal size would exceed it.
+        """
+        self.capacity = max(1, capacity)
+        ideal_bits = math.ceil(
+            -self.capacity * math.log(error_rate) / (math.log(2) ** 2)
+        )
+        self.bits = max(8, min(ideal_bits, max_bytes * 8))
+        self.hash_count = max(1, round(self.bits / self.capacity * math.log(2)))
+        self._array = bytearray((self.bits + 7) // 8)
+
+    @property
+    def size_bytes(self) -> int:
+        """Memory held by the bit array."""
+        return len(self._array)
+
+    @property
+    def expected_error_rate(self) -> float:
+        """False-positive rate this filter actually achieves at capacity."""
+        exponent = -self.hash_count * self.capacity / self.bits
+        return float((1.0 - math.exp(exponent)) ** self.hash_count)
+
+    def _positions(self, item: str) -> list[int]:
+        """Derive this item's bit positions.
+
+        Args:
+            item: The word to hash.
+
+        Returns:
+            hash_count bit indices.
+        """
+        # Kirsch-Mitzenmacher: k probes derived from two hashes. hash() is
+        # SipHash with a per-process seed, which is plenty here -- the filter is
+        # never persisted or shared, and a measured error rate confirms it
+        # tracks theory.
+        first = hash(item)
+        second = hash(item + "\x00bitbrew") | 1
+        return [(first + probe * second) % self.bits for probe in range(self.hash_count)]
+
+    def probably_contains(self, item: str) -> bool:
+        """Query membership without recording the item.
+
+        Args:
+            item: The word to look up.
+
+        Returns:
+            True if the item was probably added, False if it definitely was not.
+        """
+        return all(
+            self._array[position >> 3] & (1 << (position & 7))
+            for position in self._positions(item)
+        )
+
+    def add_if_absent(self, item: str) -> bool:
+        """Record an item, reporting whether it looked new.
+
+        Args:
+            item: The word to record.
+
+        Returns:
+            True if the item was probably absent, False if probably present.
+            False may be wrong at the filter's error rate; True never is.
+        """
+        array = self._array
+        seen = True
+        for position in self._positions(item):
+            index, mask = position >> 3, 1 << (position & 7)
+            if not array[index] & mask:
+                seen = False
+                array[index] |= mask
+        return not seen
+
+
+def _deduplicated_approx(
+    words: Iterable[str], bloom: _BloomFilter
+) -> Generator[str, None, None]:
+    """Deduplicate through a Bloom filter, in memory bounded by the filter.
+
+    Args:
+        words: Input word iterable.
+        bloom: The sized filter to record words in.
+
+    Yields:
+        Words that the filter judged unseen.
+    """
+    for word in words:
+        if bloom.add_if_absent(word):
+            yield word
+
+
+@dataclasses.dataclass(frozen=True)
+class _RunConfig:
+    """Everything a run needs, already validated."""
+
+    patterns: list[str]
+    charset: str
+    regex: "re.Pattern[str] | None"
+    min_len: int | None
+    max_len: int | None
+    limit: int | None
+    chunk_size: int
+    output_path: str | None
+    use_compress: bool
+    dedup: str  # "none", "exact" or "approx"
+    dedup_error: float
+    total_estimate: int
+    count_only: bool
+
+    @property
+    def effective_scale(self) -> int:
+        """Upper bound on how many words this run will actually emit.
+
+        --limit caps the output regardless of how large the pattern space is,
+        so this is what the --force guard should be asking about.
+
+        Returns:
+            The bounded output size.
+        """
+        if self.limit is None:
+            return self.total_estimate
+        return min(self.total_estimate, self.limit)
+
+    @property
+    def exact_output_count(self) -> int | None:
+        """The output size, when it is knowable without generating anything.
+
+        Returns:
+            The exact number of words the run will emit, or None when filters,
+            deduplication, or a saturated estimate make it unknowable.
+        """
+        if self.dedup != "none":
+            return None
+        if self.min_len is not None or self.max_len is not None:
+            return None
+        if self.regex is not None or self.total_estimate >= _MAX_ESTIMATE:
+            return None
+        if self.limit is not None:
+            return min(self.total_estimate, self.limit)
+        return self.total_estimate
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser for the CLI.
 
@@ -426,24 +688,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Generate wordlists from patterns using wildcard substitution.",
     )
+    parser.add_argument("--version", action="version", version=f"bitbrew {__version__}")
     parser.add_argument(
         "-p", "--pattern", action="append", required=True,
-        help="Pattern to expand (repeatable). Use * for one char, ? for zero-or-one char.",
+        help="Pattern to expand (repeatable). Use * for one char, ? for zero-or-one "
+             "char, and a backslash to escape either.",
     )
     parser.add_argument(
         "-o", "--output", default=None,
         help="Output file path. If omitted, write to stdout.",
     )
     parser.add_argument(
-        "--charset", default="lower",
+        "--charset", default=None,
         help="Charset preset (lower, upper, digits, symbols, all) or raw chars. "
              "Combine presets with commas: 'lower,digits'. Default: lower.",
+    )
+    parser.add_argument(
+        "--charset-file", default=None,
+        help="Read the charset verbatim from a file, allowing commas and spaces.",
     )
     parser.add_argument("--min-len", type=int, default=None, help="Minimum word length.")
     parser.add_argument("--max-len", type=int, default=None, help="Maximum word length.")
     parser.add_argument(
         "--filter", dest="regex_filter", default=None,
         help="Python regex; only matching words are kept.",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="Stop after N words. Useful for sampling a huge pattern space.",
     )
     parser.add_argument("--count", action="store_true", help="Print count only, no words.")
     parser.add_argument("--compress", action="store_true", help="Write output as .gz.")
@@ -469,7 +741,345 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stream without deduplicating. Deduplication holds every emitted "
              "word in memory; disable it for very large runs.",
     )
+    parser.add_argument(
+        "--dedup-approx", action="store_true",
+        help="Deduplicate in bounded memory using a Bloom filter. May drop a "
+             "small fraction of valid words; see --dedup-error.",
+    )
+    parser.add_argument(
+        "--dedup-error", type=float, default=1e-6,
+        help="Target false-positive rate for --dedup-approx (default: 1e-6).",
+    )
     return parser
+
+
+def _resolve_charset_option(args: argparse.Namespace) -> str:
+    """Resolve the charset from --charset or --charset-file.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        The resolved character string.
+
+    Raises:
+        _CliError: If both options are given, or the file cannot be read.
+    """
+    if args.charset_file is not None:
+        if args.charset is not None:
+            raise _CliError("--charset and --charset-file are mutually exclusive.")
+        try:
+            return load_charset_file(args.charset_file)
+        except OSError as exc:
+            raise _CliError(
+                f"could not read --charset-file '{args.charset_file}': {exc}"
+            ) from exc
+    return resolve_charset(args.charset if args.charset is not None else "lower")
+
+
+def _resolve_regex_option(args: argparse.Namespace) -> "re.Pattern[str] | None":
+    """Compile and screen the --filter regex.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        The compiled pattern, or None when no filter was given.
+
+    Raises:
+        _CliError: If the regex is invalid or fails safety screening.
+    """
+    if not args.regex_filter:
+        return None
+    source = args.regex_filter
+    override = " Use --allow-unsafe-regex to run it anyway."
+
+    if not args.allow_unsafe_regex:
+        structural = _check_regex_safety(source)
+        if structural:
+            raise _CliError(f"unsafe regex '{source}': {structural}.{override}")
+    try:
+        regex = re.compile(source)
+    except re.error as exc:
+        raise _CliError(f"invalid regex '{source}': {exc}") from exc
+    if not args.allow_unsafe_regex:
+        timing = _probe_regex_blowup(regex, source)
+        if timing:
+            raise _CliError(f"unsafe regex '{source}': {timing}.{override}")
+    return regex
+
+
+def _resolve_dedup_option(args: argparse.Namespace) -> str:
+    """Decide which deduplication strategy the run uses.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        "none", "exact" or "approx".
+
+    Raises:
+        _CliError: If conflicting or out-of-range options were given.
+    """
+    if args.no_dedup and args.dedup_approx:
+        raise _CliError("--no-dedup and --dedup-approx are mutually exclusive.")
+    if not 0.0 < args.dedup_error < 1.0:
+        raise _CliError("--dedup-error must be between 0 and 1, exclusive.")
+    if args.no_dedup or not _needs_dedup(args.pattern):
+        return "none"
+    return "approx" if args.dedup_approx else "exact"
+
+
+def _resolve_options(args: argparse.Namespace) -> _RunConfig:
+    """Validate arguments and resolve them into a run configuration.
+
+    Args:
+        args: Parsed arguments.
+
+    Returns:
+        The validated configuration.
+
+    Raises:
+        _CliError: If any argument is invalid.
+    """
+    if args.chunk_size <= 0:
+        raise _CliError("--chunk-size must be greater than 0.")
+    if args.limit is not None and args.limit <= 0:
+        raise _CliError("--limit must be greater than 0.")
+    for flag, value in (("--min-len", args.min_len), ("--max-len", args.max_len)):
+        if value is not None and value < 0:
+            raise _CliError(f"{flag} must be zero or greater.")
+    if (
+        args.min_len is not None
+        and args.max_len is not None
+        and args.min_len > args.max_len
+    ):
+        raise _CliError(
+            f"--min-len ({args.min_len}) is greater than --max-len ({args.max_len})."
+        )
+
+    charset = _resolve_charset_option(args)
+    if not charset:
+        raise _CliError(
+            "resolved charset is empty. Provide a non-empty --charset value."
+        )
+
+    total_estimate = 0
+    for pattern in args.pattern:
+        try:
+            _, kinds = _parse_pattern(pattern)
+        except ValueError as exc:
+            raise _CliError(f"invalid pattern '{pattern}': {exc}") from exc
+        if not kinds:
+            print(
+                f"Warning: pattern '{pattern}' has no wildcards; emitting as literal.",
+                file=sys.stderr,
+            )
+        total_estimate += estimate_count(pattern, len(charset))
+
+    output_path = args.output
+    if output_path:
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.isdir(output_dir):
+            raise _CliError(f"output directory '{output_dir}' does not exist.")
+        if os.path.exists(output_path) and not args.overwrite:
+            raise _CliError(
+                f"output file '{output_path}' already exists. "
+                f"Use --overwrite to replace."
+            )
+
+    return _RunConfig(
+        patterns=list(args.pattern),
+        charset=charset,
+        regex=_resolve_regex_option(args),
+        min_len=args.min_len,
+        max_len=args.max_len,
+        limit=args.limit,
+        chunk_size=args.chunk_size,
+        output_path=output_path,
+        use_compress=args.compress or bool(output_path and output_path.endswith(".gz")),
+        dedup=_resolve_dedup_option(args),
+        dedup_error=args.dedup_error,
+        total_estimate=total_estimate,
+        count_only=args.count,
+    )
+
+
+def _dedup_stage(words: Iterable[str], cfg: _RunConfig) -> Iterable[str]:
+    """Apply the configured deduplication strategy, reporting its cost.
+
+    Args:
+        words: Input word stream.
+        cfg: Resolved run configuration.
+
+    Returns:
+        The deduplicated stream, or the input unchanged when dedup is off.
+    """
+    if cfg.dedup == "none":
+        return words
+    if cfg.dedup == "approx":
+        bloom = _BloomFilter(cfg.total_estimate, cfg.dedup_error, _BLOOM_MAX_BYTES)
+        print(
+            f"Note: approximate deduplication in {_human_bytes(bloom.size_bytes)}, "
+            f"expected false-positive rate {bloom.expected_error_rate:.2g}. "
+            f"Some valid words may be dropped.",
+            file=sys.stderr,
+        )
+        return _deduplicated_approx(words, bloom)
+    if cfg.total_estimate > _DEDUP_WARN_THRESHOLD:
+        print(
+            f"Warning: deduplicating ~{cfg.total_estimate:,} words holds them all in "
+            f"memory (roughly {_human_bytes(cfg.total_estimate * _BYTES_PER_WORD)}). "
+            f"Use --dedup-approx for bounded memory, or --no-dedup to stream.",
+            file=sys.stderr,
+        )
+    return _deduplicated(words)
+
+
+def _build_pipeline(cfg: _RunConfig) -> Iterator[str]:
+    """Compose the full generate-dedup-filter-limit stream.
+
+    Args:
+        cfg: Resolved run configuration.
+
+    Returns:
+        The finished word stream.
+    """
+
+    def expand() -> Generator[str, None, None]:
+        for pattern in cfg.patterns:
+            yield from _expand_pattern(pattern, cfg.charset)
+
+    words = _apply_filters(
+        _dedup_stage(expand(), cfg), cfg.min_len, cfg.max_len, cfg.regex
+    )
+    if cfg.limit is not None:
+        return itertools.islice(words, cfg.limit)
+    return words
+
+
+def _make_progress(cfg: _RunConfig) -> _ProgressBar | None:
+    """Build a tqdm bar when tqdm is installed.
+
+    Args:
+        cfg: Resolved run configuration.
+
+    Returns:
+        A progress bar, or None when tqdm is unavailable.
+    """
+    try:
+        import tqdm as tqdm_mod
+    except ImportError:
+        return None
+    # Without an exact count a bar could never reach 100%, so show a counter.
+    bar: _ProgressBar = tqdm_mod.tqdm(
+        total=cfg.exact_output_count, unit="words", desc="Generating"
+    )
+    return bar
+
+
+def _write_to_file(words: Iterable[str], cfg: _RunConfig) -> int:
+    """Generate into cfg.output_path atomically and interruptibly.
+
+    Args:
+        words: The finished word stream.
+        cfg: Resolved run configuration.
+
+    Returns:
+        Process exit code.
+    """
+    if cfg.output_path is None:
+        raise ValueError("_write_to_file requires an output path")
+    output_path = cfg.output_path
+
+    interrupted = False
+
+    def handle_interrupt(sig: int, frame: object) -> None:
+        nonlocal interrupted
+        interrupted = True
+
+    old_handler = signal.signal(signal.SIGINT, handle_interrupt)
+
+    # Build into a sidecar file and rename on success, so an interrupted or
+    # failed run never leaves a truncated wordlist at output_path.
+    temp_path = output_path + ".part"
+    progress: _ProgressBar | None = None
+    try:
+        progress = _make_progress(cfg)
+        if cfg.use_compress:
+            with gzip.open(temp_path, "wb") as binary:
+                written = _chunked_write(
+                    words, binary, cfg.chunk_size, progress, lambda: interrupted
+                )
+        else:
+            with open(temp_path, "w", encoding="utf-8") as text:
+                written = _chunked_write(
+                    words, text, cfg.chunk_size, progress, lambda: interrupted
+                )
+
+        if progress is not None:
+            progress.close()
+
+        # A signal can still land between the last poll and here.
+        if interrupted:
+            raise KeyboardInterrupt
+
+        os.replace(temp_path, output_path)
+        print(f"Wrote {written:,} words to {output_path}", file=sys.stderr)
+    except KeyboardInterrupt:
+        _remove_if_exists(temp_path)
+        print("\nInterrupted. Partial output file removed.", file=sys.stderr)
+        return 130
+    except OSError as exc:
+        _remove_if_exists(temp_path)
+        print(f"Error: could not write to '{output_path}': {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if progress is not None:
+            progress.close()
+        signal.signal(signal.SIGINT, old_handler)
+    return 0
+
+
+def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
+    """Stream words to stdout, gzipped when asked.
+
+    Args:
+        words: The finished word stream.
+        cfg: Resolved run configuration.
+
+    Returns:
+        Process exit code.
+    """
+    if not cfg.use_compress:
+        try:
+            for word in words:
+                print(word)
+        except (BrokenPipeError, KeyboardInterrupt):
+            return 0
+        return 0
+
+    # Gzip to stdout, but never at a terminal -- binary down a TTY is noise.
+    if sys.stdout.isatty():
+        print(
+            "Error: refusing to write compressed output to a terminal. "
+            "Redirect it, pipe it, or use -o.",
+            file=sys.stderr,
+        )
+        return 1
+    raw = getattr(sys.stdout, "buffer", None)
+    if raw is None:
+        print(
+            "Error: this stdout does not accept binary output; use -o instead.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        with gzip.GzipFile(fileobj=raw, mode="wb") as binary:
+            _chunked_write(words, binary, cfg.chunk_size)
+    except (BrokenPipeError, KeyboardInterrupt):
+        return 0
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -481,227 +1091,37 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         Exit code.
     """
-    parser = build_parser()
-    args = parser.parse_args(argv)
-
-    # Validate regex filter
-    regex = None
-    if args.regex_filter:
-        if not args.allow_unsafe_regex:
-            safety_err = _check_regex_safety(args.regex_filter)
-            if safety_err:
-                print(
-                    f"Error: unsafe regex '{args.regex_filter}': {safety_err}. "
-                    f"Use --allow-unsafe-regex to run it anyway.",
-                    file=sys.stderr,
-                )
-                return 1
-        try:
-            regex = re.compile(args.regex_filter)
-        except re.error as e:
-            print(f"Error: invalid regex '{args.regex_filter}': {e}", file=sys.stderr)
-            return 1
-        if not args.allow_unsafe_regex:
-            probe_err = _probe_regex_blowup(regex, args.regex_filter)
-            if probe_err:
-                print(
-                    f"Error: unsafe regex '{args.regex_filter}': {probe_err}. "
-                    f"Use --allow-unsafe-regex to run it anyway.",
-                    file=sys.stderr,
-                )
-                return 1
-
-    # Validate chunk-size
-    if args.chunk_size <= 0:
-        print("Error: --chunk-size must be greater than 0.", file=sys.stderr)
+    args = build_parser().parse_args(argv)
+    try:
+        cfg = _resolve_options(args)
+    except _CliError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    charset = resolve_charset(args.charset)
+    # Counting is free when nothing can drop a word, so answer before the
+    # scale guard: previewing a huge pattern should not need --force.
+    if cfg.count_only:
+        exact = cfg.exact_output_count
+        if exact is not None:
+            print(exact)
+            return 0
 
-    # Validate charset is not empty
-    if not charset:
+    if cfg.effective_scale > _FORCE_THRESHOLD and not args.force:
         print(
-            "Error: resolved charset is empty. Provide a non-empty --charset value.",
-            file=sys.stderr,
-        )
-        return 1
-
-    # Validate min-len / max-len
-    for flag_name, value in (("--min-len", args.min_len), ("--max-len", args.max_len)):
-        if value is not None and value < 0:
-            print(f"Error: {flag_name} must be zero or greater.", file=sys.stderr)
-            return 1
-
-    if args.min_len is not None and args.max_len is not None and args.min_len > args.max_len:
-        print(
-            f"Error: --min-len ({args.min_len}) is greater than --max-len ({args.max_len}).",
-            file=sys.stderr,
-        )
-        return 1
-
-    # Estimate total count and warn
-    total_estimate = 0
-    for pattern in args.pattern:
-        has_wildcard = any(c in pattern for c in "*?")
-        if not has_wildcard:
-            print(
-                f"Warning: pattern '{pattern}' has no wildcards; emitting as literal.",
-                file=sys.stderr,
-            )
-        total_estimate += estimate_count(pattern, len(charset))
-
-    if total_estimate > 10_000_000 and not args.force:
-        print(
-            f"Warning: estimated {total_estimate:,} combinations. "
+            f"Warning: estimated {cfg.effective_scale:,} combinations. "
             f"Use --force to proceed.",
             file=sys.stderr,
         )
         return 1
 
-    # Check output file
-    output_path = args.output
-    use_compress = args.compress
-    if output_path and output_path.endswith(".gz"):
-        use_compress = True
+    words = _build_pipeline(cfg)
 
-    if output_path:
-        output_dir = os.path.dirname(output_path)
-        if output_dir and not os.path.isdir(output_dir):
-            print(
-                f"Error: output directory '{output_dir}' does not exist.",
-                file=sys.stderr,
-            )
-            return 1
-
-    if output_path and os.path.exists(output_path) and not args.overwrite:
-        print(
-            f"Error: output file '{output_path}' already exists. Use --overwrite to replace.",
-            file=sys.stderr,
-        )
-        return 1
-
-    # Build word generator pipeline
-    def word_pipeline() -> Generator[str, None, None]:
-        for pattern in args.pattern:
-            yield from _expand_pattern(pattern, charset)
-
-    words: Iterable[str] = word_pipeline()
-    dedup_active = not args.no_dedup and _needs_dedup(args.pattern)
-    if dedup_active:
-        if total_estimate > _DEDUP_WARN_THRESHOLD:
-            print(
-                f"Warning: deduplicating ~{total_estimate:,} words holds them all in "
-                f"memory (roughly {_human_bytes(total_estimate * _BYTES_PER_WORD)}). "
-                f"Use --no-dedup to stream instead.",
-                file=sys.stderr,
-            )
-        words = _deduplicated(words)
-    words = _apply_filters(words, args.min_len, args.max_len, regex)
-
-    # Count-only mode
-    if args.count:
-        count = sum(1 for _ in words)
-        print(count)
+    if cfg.count_only:
+        print(sum(1 for _ in words))
         return 0
-
-    # Output
-    if output_path:
-        # Set up interrupt handler to clean up partial file
-        interrupted = False
-
-        def _handle_interrupt(sig: int, frame: object) -> None:
-            nonlocal interrupted
-            interrupted = True
-
-        old_handler = signal.signal(signal.SIGINT, _handle_interrupt)
-
-        # Build into a sidecar file and rename on success, so an interrupted
-        # or failed run never leaves a truncated wordlist at output_path.
-        temp_path = output_path + ".part"
-        progress = None
-        try:
-            # total_estimate is an upper bound: filters and dedup drop words, and
-            # a saturated estimate is not a real number at all. Fall back to a
-            # plain counter rather than a bar that can never reach 100%.
-            exact_total = (
-                total_estimate < _MAX_ESTIMATE
-                and args.min_len is None
-                and args.max_len is None
-                and regex is None
-                and not dedup_active
-            )
-            try:
-                import tqdm as tqdm_mod
-                progress = tqdm_mod.tqdm(
-                    total=total_estimate if exact_total else None,
-                    unit="words", desc="Generating",
-                )
-            except ImportError:
-                pass
-
-            if use_compress:
-                with gzip.open(temp_path, "wb") as f:
-                    written = _chunked_write(
-                        words, f, args.chunk_size, progress, lambda: interrupted
-                    )
-            else:
-                with open(temp_path, "w", encoding="utf-8") as f:
-                    written = _chunked_write(
-                        words, f, args.chunk_size, progress, lambda: interrupted
-                    )
-
-            if progress is not None:
-                progress.close()
-
-            # A signal can still land between the last poll and here.
-            if interrupted:
-                raise KeyboardInterrupt
-
-            os.replace(temp_path, output_path)
-            print(f"Wrote {written:,} words to {output_path}", file=sys.stderr)
-
-        except KeyboardInterrupt:
-            _remove_if_exists(temp_path)
-            print("\nInterrupted. Partial output file removed.", file=sys.stderr)
-            return 130
-        except OSError as e:
-            _remove_if_exists(temp_path)
-            print(f"Error: could not write to '{output_path}': {e}", file=sys.stderr)
-            return 1
-        finally:
-            if progress is not None:
-                progress.close()
-            signal.signal(signal.SIGINT, old_handler)
-    elif use_compress:
-        # Gzip to stdout, but never at a terminal -- binary down a TTY is noise.
-        if sys.stdout.isatty():
-            print(
-                "Error: refusing to write compressed output to a terminal. "
-                "Redirect it, pipe it, or use -o.",
-                file=sys.stderr,
-            )
-            return 1
-        raw = getattr(sys.stdout, "buffer", None)
-        if raw is None:
-            print(
-                "Error: this stdout does not accept binary output; use -o instead.",
-                file=sys.stderr,
-            )
-            return 1
-        try:
-            with gzip.GzipFile(fileobj=raw, mode="wb") as f:
-                _chunked_write(words, f, args.chunk_size)
-        except (BrokenPipeError, KeyboardInterrupt):
-            return 0
-    else:
-        # Write to stdout
-        try:
-            for word in words:
-                print(word)
-        except (BrokenPipeError, KeyboardInterrupt):
-            return 0
-
-    return 0
+    if cfg.output_path:
+        return _write_to_file(words, cfg)
+    return _write_to_stdout(words, cfg)
 
 
 if __name__ == "__main__":

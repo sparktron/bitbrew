@@ -12,14 +12,15 @@
 
 ## ✨ Features
 
-- 🔣 **Wildcard patterns** — `*` for exactly one char, `?` for zero-or-one char
+- 🔣 **Wildcard patterns** — `*` for exactly one char, `?` for zero-or-one char, `\\` to escape either
 - 🔡 **Flexible charsets** — built-in presets, comma-combined, or raw custom strings
 - 📁 **Streaming output** — write to stdout, a file, or gzip-compressed output
 - 🔍 **Filtering** — by minimum/maximum length and/or regex (screened for catastrophic backtracking)
 - 🔂 **Multiple patterns** — supply `-p` multiple times; results are deduplicated by default
-- 🔢 **Count mode** — preview how many words will be generated without outputting them
+- 🔢 **Count mode** — preview how many words will be generated, answered instantly from arithmetic
 - 📊 **Progress bar** — optional `tqdm` integration for large runs
 - 🛡️ **Safety rails** — `--force` for >10 M combinations, `--overwrite` for existing files, atomic writes so a failed run never leaves a truncated wordlist
+- ✂️ **Sampling** — `--limit N` takes the first N words of an arbitrarily large space
 - 🐍 **Library API** — use `generate_wordlist()` directly in your own code
 
 ---
@@ -79,12 +80,16 @@ bitbrew -p "**" --charset "abc123"
 |----------|---------|
 | `*` | **Exactly one** character from the active charset |
 | `?` | **Zero or one** character — generates two variants per position |
+| `\\` | Escapes the next character, making it literal |
 
 Literal characters are preserved as-is. Multiple wildcards produce the full Cartesian product.
 
 ```bash
 # ? generates optional positions: "ab" and "axb"
 bitbrew -p "a?b" --charset "x"
+
+# \\ makes a wildcard literal: emits the single word "pw*"
+bitbrew -p 'pw\\*' --charset digits
 ```
 
 ---
@@ -112,6 +117,15 @@ bitbrew -p "**" --charset "aeiou0123"
 ```
 
 Duplicate characters in the resolved charset are automatically removed.
+
+**Commas and spaces** cannot be expressed through `--charset`, since it splits on commas
+and trims whitespace. Use `--charset-file` to supply a charset verbatim — every character
+in the file is used as-is, apart from a single trailing newline:
+
+```bash
+printf 'abc, ' > charset.txt
+bitbrew -p "**" --charset-file charset.txt
+```
 
 ---
 
@@ -196,6 +210,19 @@ you can stream without it:
 bitbrew -p "admin*" -p "root*" --charset all --force --no-dedup -o wordlist.txt
 ```
 
+Or keep deduplicating in **bounded memory** with `--dedup-approx`, which uses a Bloom
+filter sized from the estimated output:
+
+```bash
+bitbrew -p "admin*" -p "root*" --charset all --force --dedup-approx -o wordlist.txt
+```
+
+> ⚠️ Approximate deduplication can drop a small, quantified fraction of **valid** words —
+> that is the trade for constant memory. The default rate is one in a million; tune it with
+> `--dedup-error`. bitbrew prints the filter's size and its expected error rate before
+> starting. It never keeps a duplicate, and never drops a word it has not seen; the only
+> error is dropping a word it wrongly believes it has seen.
+
 ---
 
 ### Count mode
@@ -208,6 +235,34 @@ bitbrew -p "****" --charset lower --count
 ```
 
 Count mode respects `--min-len`, `--max-len`, and `--filter`.
+
+When nothing can drop a word — no filters, no deduplication — the answer is pure
+arithmetic, so counting an enormous space is instant and needs no `--force`:
+
+```bash
+$ time bitbrew -p "*******" --charset lower --count
+8031810176
+real    0m0.05s
+```
+
+With filters in play the count is exact rather than estimated, which means bitbrew has to
+generate the words to count them.
+
+---
+
+### Sampling with `--limit`
+
+`--limit N` stops after N words, which makes a huge pattern space explorable without
+generating it:
+
+```bash
+# First 5 of 8 billion, instantly
+bitbrew -p "*******" --charset lower --limit 5
+```
+
+Because `--limit` bounds the output, it also bounds the `--force` check — sampling never
+needs confirmation. Note that a `--limit` combined with a restrictive `--filter` can still
+scan a lot of the space looking for matches.
 
 ---
 
@@ -286,11 +341,12 @@ count   = estimate_count("****", len(charset))  # 1,679,616
 ## 🔧 CLI reference
 
 ```
-usage: bitbrew [-h] -p PATTERN [-o OUTPUT] [--charset CHARSET]
-               [--min-len MIN_LEN] [--max-len MAX_LEN]
-               [--filter REGEX_FILTER] [--count] [--compress]
-               [--chunk-size CHUNK_SIZE] [--force] [--overwrite]
-               [--allow-unsafe-regex] [--no-dedup]
+usage: bitbrew [-h] [--version] -p PATTERN [-o OUTPUT] [--charset CHARSET]
+               [--charset-file CHARSET_FILE] [--min-len MIN_LEN]
+               [--max-len MAX_LEN] [--filter REGEX_FILTER] [--limit LIMIT]
+               [--count] [--compress] [--chunk-size CHUNK_SIZE] [--force]
+               [--overwrite] [--allow-unsafe-regex] [--no-dedup]
+               [--dedup-approx] [--dedup-error DEDUP_ERROR]
 ```
 
 | Flag | Description |
@@ -298,9 +354,11 @@ usage: bitbrew [-h] -p PATTERN [-o OUTPUT] [--charset CHARSET]
 | `-p, --pattern` | Pattern to expand — repeatable, results are deduplicated |
 | `-o, --output` | Output file path (default: stdout) |
 | `--charset` | Preset name(s) or raw char string (default: `lower`) |
+| `--charset-file` | Read the charset verbatim from a file |
 | `--min-len` | Minimum word length (inclusive) |
 | `--max-len` | Maximum word length (inclusive) |
 | `--filter` | Python regex; only matching words are kept |
+| `--limit` | Stop after N words |
 | `--count` | Print word count only — no words emitted |
 | `--compress` | Write gzip-compressed output |
 | `--chunk-size` | Words per streaming chunk (default: `10000`) |
@@ -308,6 +366,9 @@ usage: bitbrew [-h] -p PATTERN [-o OUTPUT] [--charset CHARSET]
 | `--overwrite` | Overwrite an existing output file |
 | `--allow-unsafe-regex` | Skip `--filter` safety screening |
 | `--no-dedup` | Stream without deduplicating (constant memory, duplicates kept) |
+| `--dedup-approx` | Deduplicate in bounded memory via a Bloom filter |
+| `--dedup-error` | Target false-positive rate for `--dedup-approx` (default: `1e-6`) |
+| `--version` | Print the version and exit |
 
 ---
 
@@ -318,11 +379,13 @@ pip install -e ".[dev,progress]"
 python -m pytest test_bitbrew.py -v
 ```
 
-Linting uses [ruff](https://docs.astral.sh/ruff/); CI runs it alongside the test matrix on
-Python 3.10–3.13:
+Linting uses [ruff](https://docs.astral.sh/ruff/) and type-checking uses
+[mypy](https://mypy-lang.org/) in `--strict` mode. CI runs both alongside the test matrix
+on Python 3.10–3.13:
 
 ```bash
 ruff check .
+mypy
 ```
 
 The test suite covers:
@@ -337,6 +400,8 @@ The test suite covers:
 - ReDoS screening: both layers, plus the bound on screening's own cost
 - Compressed output to a file and to a pipe
 - The installed `bitbrew` console script
+- Pattern escapes, `--charset-file`, `--limit`, and analytic counting
+- The Bloom filter's *measured* false-positive rate against its predicted one
 - Large-pattern stress tests
 
 ---

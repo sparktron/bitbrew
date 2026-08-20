@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bitbrew"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A CLI tool that generates wordlists by expanding patterns with wildcard substitution."
 readme = "README.md"
 license = "MIT"
@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 
 [project.optional-dependencies]
 progress = ["tqdm"]
-dev = ["pytest"]
+dev = ["pytest", "ruff", "mypy"]
 
 [project.scripts]
 bitbrew = "bitbrew:main"
@@ -20,8 +20,22 @@ bitbrew = "bitbrew:main"
 [tool.setuptools]
 py-modules = ["bitbrew"]
 
+# Single source of truth: bitbrew.py stays runnable as a standalone script.
+[tool.setuptools.dynamic]
+version = {attr = "bitbrew.__version__"}
+
 [tool.pytest.ini_options]
 testpaths = ["test_bitbrew.py"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["bitbrew.py"]
+
+# tqdm is an optional extra and ships no stubs.
+[[tool.mypy.overrides]]
+module = "tqdm.*"
+ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 100
