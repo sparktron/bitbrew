@@ -16,6 +16,7 @@ Usage as a library:
 """
 
 import argparse
+import contextlib
 import gzip
 import io
 import itertools
@@ -23,7 +24,9 @@ import os
 import re
 import signal
 import sys
-from typing import Callable, Generator, Iterable, Optional
+import time
+from collections.abc import Callable, Generator, Iterable
+from typing import Optional
 
 CHARSETS = {
     "lower": "abcdefghijklmnopqrstuvwxyz",
@@ -99,9 +102,7 @@ def generate_wordlist(pattern: str, charset: str = "lower") -> Generator[str, No
     Yields:
         Generated words.
     """
-    chars = resolve_charset(charset)
-    _yield_from = _expand_pattern(pattern, chars)
-    yield from _yield_from
+    yield from _expand_pattern(pattern, resolve_charset(charset))
 
 
 def _expand_pattern(pattern: str, chars: str) -> Generator[str, None, None]:
@@ -182,13 +183,32 @@ _REDOS_PATTERN = re.compile(
 )
 
 
-def _check_regex_safety(pattern: str) -> Optional[str]:
+# Timing probe: catastrophic backtracking grows exponentially with input
+# length, so it shows up as a blowup across a short ladder of adversarial
+# inputs long before any single match becomes slow. Probing bails the moment
+# the cumulative budget is spent, which bounds the cost of screening a
+# genuinely pathological pattern.
+_PROBE_LENGTHS = tuple(range(8, 41, 2))
+_PROBE_BUDGET = 0.05  # seconds of cumulative match time before we call it unsafe
+_PROBE_MAX_SEEDS = 4
+
+
+def _check_regex_safety(pattern: str) -> str | None:
     """Check a regex pattern for common ReDoS indicators.
 
-    Returns an error message if the pattern looks dangerous, or None if it
-    appears safe.
+    This is a structural check only; see _probe_regex_blowup for the empirical
+    one. Escaped characters are stripped first, since a literal '\\(' is not
+    grouping syntax and cannot nest a quantifier.
+
+    Args:
+        pattern: The raw regex source.
+
+    Returns:
+        An error message if the pattern looks dangerous, or None if it appears
+        safe by this check.
     """
-    if _REDOS_PATTERN.search(pattern):
+    unescaped = re.sub(r"\\.", "", pattern, flags=re.DOTALL)
+    if _REDOS_PATTERN.search(unescaped):
         return (
             "pattern contains nested quantifiers which can cause catastrophic "
             "backtracking (ReDoS)"
@@ -196,10 +216,63 @@ def _check_regex_safety(pattern: str) -> Optional[str]:
     return None
 
 
+def _probe_seeds(pattern: str) -> list[str]:
+    """Pick adversarial repeat units for probing, drawn from the pattern itself.
+
+    A pattern only backtracks catastrophically on input built from characters it
+    can actually consume, so the literals it mentions make far better probe
+    material than a fixed alphabet.
+
+    Args:
+        pattern: The raw regex source.
+
+    Returns:
+        Repeat units to build probe strings from.
+    """
+    chars: list[str] = []
+    for char in re.findall(r"[A-Za-z0-9]", pattern):
+        if char not in chars:
+            chars.append(char)
+        if len(chars) >= _PROBE_MAX_SEEDS:
+            break
+    if not chars:
+        chars = ["a"]
+    seeds = list(chars)
+    if len(chars) >= 2:
+        seeds.append(chars[0] + chars[1])
+    return seeds
+
+
+def _probe_regex_blowup(regex: "re.Pattern[str]", pattern: str) -> str | None:
+    """Time a compiled regex against growing adversarial inputs.
+
+    Args:
+        regex: The compiled pattern.
+        pattern: Its source, used to choose probe characters.
+
+    Returns:
+        An error message if matching blows up, or None if it stays fast.
+    """
+    seeds = _probe_seeds(pattern)
+    spent = 0.0
+    for length in _PROBE_LENGTHS:
+        for seed in seeds:
+            probe = (seed * (length // len(seed) + 1))[:length] + "\x00"
+            start = time.perf_counter()
+            regex.search(probe)
+            spent += time.perf_counter() - start
+            if spent > _PROBE_BUDGET:
+                return (
+                    f"matching took {spent * 1000:.0f} ms on a {length}-character "
+                    f"input, which indicates catastrophic backtracking (ReDoS)"
+                )
+    return None
+
+
 def _apply_filters(
     words: Iterable[str],
-    min_len: Optional[int],
-    max_len: Optional[int],
+    min_len: int | None,
+    max_len: int | None,
     regex: Optional["re.Pattern[str]"],
 ) -> Generator[str, None, None]:
     """Apply length and regex filters to a word stream.
@@ -246,8 +319,8 @@ def _chunked_write(
     words: Iterable[str],
     file_obj: "gzip.GzipFile | io.TextIOBase | io.StringIO",
     chunk_size: int,
-    progress: Optional[object] = None,
-    should_stop: Optional[Callable[[], bool]] = None,
+    progress: object | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> int:
     """Write words to a file in chunks.
 
@@ -340,10 +413,8 @@ def _remove_if_exists(path: str) -> None:
     Args:
         path: Filesystem path to remove.
     """
-    try:
+    with contextlib.suppress(OSError):
         os.remove(path)
-    except OSError:
-        pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -389,6 +460,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Overwrite output file if it already exists.",
     )
     parser.add_argument(
+        "--allow-unsafe-regex", action="store_true",
+        help="Skip the --filter safety screening. The screening is a heuristic "
+             "and does reject some safe patterns.",
+    )
+    parser.add_argument(
         "--no-dedup", action="store_true",
         help="Stream without deduplicating. Deduplication holds every emitted "
              "word in memory; disable it for very large runs.",
@@ -396,7 +472,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
 
     Args:
@@ -411,15 +487,29 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Validate regex filter
     regex = None
     if args.regex_filter:
-        safety_err = _check_regex_safety(args.regex_filter)
-        if safety_err:
-            print(f"Error: unsafe regex '{args.regex_filter}': {safety_err}", file=sys.stderr)
-            return 1
+        if not args.allow_unsafe_regex:
+            safety_err = _check_regex_safety(args.regex_filter)
+            if safety_err:
+                print(
+                    f"Error: unsafe regex '{args.regex_filter}': {safety_err}. "
+                    f"Use --allow-unsafe-regex to run it anyway.",
+                    file=sys.stderr,
+                )
+                return 1
         try:
             regex = re.compile(args.regex_filter)
         except re.error as e:
             print(f"Error: invalid regex '{args.regex_filter}': {e}", file=sys.stderr)
             return 1
+        if not args.allow_unsafe_regex:
+            probe_err = _probe_regex_blowup(regex, args.regex_filter)
+            if probe_err:
+                print(
+                    f"Error: unsafe regex '{args.regex_filter}': {probe_err}. "
+                    f"Use --allow-unsafe-regex to run it anyway.",
+                    file=sys.stderr,
+                )
+                return 1
 
     # Validate chunk-size
     if args.chunk_size <= 0:
@@ -430,10 +520,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Validate charset is not empty
     if not charset:
-        print("Error: resolved charset is empty. Provide a non-empty --charset value.", file=sys.stderr)
+        print(
+            "Error: resolved charset is empty. Provide a non-empty --charset value.",
+            file=sys.stderr,
+        )
         return 1
 
-    # Validate min-len / max-len relationship
+    # Validate min-len / max-len
+    for flag_name, value in (("--min-len", args.min_len), ("--max-len", args.max_len)):
+        if value is not None and value < 0:
+            print(f"Error: {flag_name} must be zero or greater.", file=sys.stderr)
+            return 1
+
     if args.min_len is not None and args.max_len is not None and args.min_len > args.max_len:
         print(
             f"Error: --min-len ({args.min_len}) is greater than --max-len ({args.max_len}).",
@@ -446,7 +544,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     for pattern in args.pattern:
         has_wildcard = any(c in pattern for c in "*?")
         if not has_wildcard:
-            print(f"Warning: pattern '{pattern}' has no wildcards; emitting as literal.", file=sys.stderr)
+            print(
+                f"Warning: pattern '{pattern}' has no wildcards; emitting as literal.",
+                file=sys.stderr,
+            )
         total_estimate += estimate_count(pattern, len(charset))
 
     if total_estimate > 10_000_000 and not args.force:
@@ -485,7 +586,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             yield from _expand_pattern(pattern, charset)
 
     words: Iterable[str] = word_pipeline()
-    if not args.no_dedup and _needs_dedup(args.pattern):
+    dedup_active = not args.no_dedup and _needs_dedup(args.pattern)
+    if dedup_active:
         if total_estimate > _DEDUP_WARN_THRESHOLD:
             print(
                 f"Warning: deduplicating ~{total_estimate:,} words holds them all in "
@@ -518,9 +620,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         temp_path = output_path + ".part"
         progress = None
         try:
+            # total_estimate is an upper bound: filters and dedup drop words, and
+            # a saturated estimate is not a real number at all. Fall back to a
+            # plain counter rather than a bar that can never reach 100%.
+            exact_total = (
+                total_estimate < _MAX_ESTIMATE
+                and args.min_len is None
+                and args.max_len is None
+                and regex is None
+                and not dedup_active
+            )
             try:
                 import tqdm as tqdm_mod
-                progress = tqdm_mod.tqdm(total=total_estimate, unit="words", desc="Generating")
+                progress = tqdm_mod.tqdm(
+                    total=total_estimate if exact_total else None,
+                    unit="words", desc="Generating",
+                )
             except ImportError:
                 pass
 
@@ -557,6 +672,27 @@ def main(argv: Optional[list[str]] = None) -> int:
             if progress is not None:
                 progress.close()
             signal.signal(signal.SIGINT, old_handler)
+    elif use_compress:
+        # Gzip to stdout, but never at a terminal -- binary down a TTY is noise.
+        if sys.stdout.isatty():
+            print(
+                "Error: refusing to write compressed output to a terminal. "
+                "Redirect it, pipe it, or use -o.",
+                file=sys.stderr,
+            )
+            return 1
+        raw = getattr(sys.stdout, "buffer", None)
+        if raw is None:
+            print(
+                "Error: this stdout does not accept binary output; use -o instead.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            with gzip.GzipFile(fileobj=raw, mode="wb") as f:
+                _chunked_write(words, f, args.chunk_size)
+        except (BrokenPipeError, KeyboardInterrupt):
+            return 0
     else:
         # Write to stdout
         try:

@@ -15,7 +15,7 @@
 - 🔣 **Wildcard patterns** — `*` for exactly one char, `?` for zero-or-one char
 - 🔡 **Flexible charsets** — built-in presets, comma-combined, or raw custom strings
 - 📁 **Streaming output** — write to stdout, a file, or gzip-compressed output
-- 🔍 **Filtering** — by minimum/maximum length and/or regex (with partial ReDoS screening)
+- 🔍 **Filtering** — by minimum/maximum length and/or regex (screened for catastrophic backtracking)
 - 🔂 **Multiple patterns** — supply `-p` multiple times; results are deduplicated by default
 - 🔢 **Count mode** — preview how many words will be generated without outputting them
 - 📊 **Progress bar** — optional `tqdm` integration for large runs
@@ -127,6 +127,9 @@ bitbrew -p "***" --charset digits -o words.txt.gz
 # Force compression regardless of extension
 bitbrew -p "***" --charset digits -o words.txt --compress
 
+# Compressed straight to a pipe (refused if stdout is a terminal)
+bitbrew -p "***" --charset digits --compress | gunzip | wc -l
+
 # Overwrite an existing file
 bitbrew -p "***" --charset digits -o words.txt --overwrite
 ```
@@ -134,6 +137,8 @@ bitbrew -p "***" --charset digits -o words.txt --overwrite
 ---
 
 ### Filtering
+
+Length bounds are inclusive and must be zero or greater.
 
 ```bash
 # Keep only words between 4 and 5 characters long
@@ -143,11 +148,32 @@ bitbrew -p "a?b?c" --charset digits --min-len 4 --max-len 5
 bitbrew -p "***" --charset "lower,digits" --filter "^a.*9$"
 ```
 
-> ⚠️ **Partial ReDoS screening:** bitbrew rejects `--filter` regexes containing nested
-> quantifiers (e.g. `(a+)+`), one common source of catastrophic backtracking. This is a
-> heuristic, **not a guarantee**: it does not catch overlapping alternation such as
-> `(a|a)+`, and it rejects some patterns that are actually safe, like `(ab+c)+`. Do not
-> rely on it as a security boundary for regexes from an untrusted source.
+#### ReDoS screening
+
+A `--filter` regex runs against every generated word, so one that backtracks
+catastrophically turns a short run into an unbounded hang. bitbrew screens each filter in
+two ways before generating anything:
+
+1. **Structural check** — rejects nested quantifiers such as `(a+)+` or `(\d+)+`.
+2. **Timing probe** — matches the regex against a short ladder of adversarial inputs built
+   from the pattern's own alphabet and rejects it if the time grows exponentially. This
+   catches the overlapping-alternation family, like `(a|a)+$` and `(a|b|ab)*$`, that no
+   structural check sees.
+
+The probe costs well under a millisecond for a normal filter and gives up as soon as its
+own time budget is spent, so screening a pathological pattern is bounded too.
+
+```bash
+$ bitbrew -p "***" --filter "(a|a)+$"
+Error: unsafe regex '(a|a)+$': matching took 176 ms on a 20-character input, which
+indicates catastrophic backtracking (ReDoS). Use --allow-unsafe-regex to run it anyway.
+```
+
+> ⚠️ Screening is a **heuristic, not a guarantee**. It can miss a pathological pattern
+> whose trigger does not resemble its own literals, and the structural check still rejects
+> a few safe patterns such as `(ab+c)+`. Override it with `--allow-unsafe-regex` when you
+> know a filter is fine — and do not treat it as a security boundary for regexes that come
+> from somewhere you do not trust.
 
 ---
 
@@ -212,8 +238,9 @@ bitbrew -p "*****" --charset lower --force -o big.txt
 # Generating: 100%|████████████| 11.9M/11.9M [00:04<00:00, 2.54Mwords/s]
 ```
 
-The progress total is the *estimated* expansion, so it runs ahead of the real count when
-`--min-len`, `--max-len`, or `--filter` discard words.
+When `--min-len`, `--max-len`, `--filter`, or deduplication are in play the final count
+is not knowable up front, so bitbrew shows a plain counter instead of a percentage bar
+that could never reach 100%.
 
 **Interrupted?** Pressing `Ctrl+C` during file output stops generation promptly, removes
 the partial file, and exits with code `130`.
@@ -263,7 +290,7 @@ usage: bitbrew [-h] -p PATTERN [-o OUTPUT] [--charset CHARSET]
                [--min-len MIN_LEN] [--max-len MAX_LEN]
                [--filter REGEX_FILTER] [--count] [--compress]
                [--chunk-size CHUNK_SIZE] [--force] [--overwrite]
-               [--no-dedup]
+               [--allow-unsafe-regex] [--no-dedup]
 ```
 
 | Flag | Description |
@@ -279,6 +306,7 @@ usage: bitbrew [-h] -p PATTERN [-o OUTPUT] [--charset CHARSET]
 | `--chunk-size` | Words per streaming chunk (default: `10000`) |
 | `--force` | Allow >10 M combinations |
 | `--overwrite` | Overwrite an existing output file |
+| `--allow-unsafe-regex` | Skip `--filter` safety screening |
 | `--no-dedup` | Stream without deduplicating (constant memory, duplicates kept) |
 
 ---
@@ -286,7 +314,15 @@ usage: bitbrew [-h] -p PATTERN [-o OUTPUT] [--charset CHARSET]
 ## 🧪 Running tests
 
 ```bash
+pip install -e ".[dev,progress]"
 python -m pytest test_bitbrew.py -v
+```
+
+Linting uses [ruff](https://docs.astral.sh/ruff/); CI runs it alongside the test matrix on
+Python 3.10–3.13:
+
+```bash
+ruff check .
 ```
 
 The test suite covers:
@@ -298,11 +334,13 @@ The test suite covers:
   live generation run
 - Atomic output: no truncated file is left behind on error or interrupt
 - Deduplication policy and `--no-dedup`
-- ReDoS screening
+- ReDoS screening: both layers, plus the bound on screening's own cost
+- Compressed output to a file and to a pipe
+- The installed `bitbrew` console script
 - Large-pattern stress tests
 
 ---
 
 ## 📄 License
 
-[MIT](https://opensource.org/licenses/MIT) — brew freely.
+[MIT](LICENSE) — brew freely.

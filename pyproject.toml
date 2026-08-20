@@ -21,4 +21,11 @@ bitbrew = "bitbrew:main"
 py-modules = ["bitbrew"]
 
 [tool.pytest.ini_options]
-testpaths = ["."]
+testpaths = ["test_bitbrew.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
