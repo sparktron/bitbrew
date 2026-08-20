@@ -4,8 +4,8 @@ import gzip
 import io
 import os
 import signal
-import tempfile
-import threading
+import subprocess
+import sys
 import time
 import types
 from unittest import mock
@@ -19,11 +19,14 @@ from bitbrew import (
     _chunked_write,
     _deduplicated,
     _expand_pattern,
+    _needs_dedup,
     estimate_count,
     generate_wordlist,
     main,
     resolve_charset,
 )
+
+BITBREW_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bitbrew.py")
 
 
 class TestResolveCharset:
@@ -343,64 +346,105 @@ class TestGzipCorruptionAndPermissionErrors:
 
 
 class TestInterruptCleanup:
-    """Tests for SIGINT handler and partial file cleanup."""
+    """Tests for SIGINT handling, partial file cleanup, and atomic rename."""
 
-    def test_interrupt_removes_partial_file(self, tmp_path: "os.PathLike[str]") -> None:
-        """Ctrl+C during file write should remove the partial output file."""
-        outfile = str(tmp_path / "partial.txt")
+    def test_should_stop_aborts_write_loop(self) -> None:
+        """_chunked_write must poll should_stop and abandon an endless stream."""
+        buf = io.StringIO()
+        stop = {"flag": False}
+        flushes = []
 
-        # Patch _chunked_write to simulate an interrupt mid-write
-        original_chunked_write = _chunked_write
+        class TripOnFirstFlush:
+            """Stands in for tqdm; trips the stop flag when a chunk lands."""
 
-        def interrupting_write(words, file_obj, chunk_size, progress=None):
-            # Write some data then send SIGINT to ourselves
-            count = 0
-            for word in words:
-                file_obj.write(word + "\n")
-                count += 1
-                if count >= 1:
-                    os.kill(os.getpid(), signal.SIGINT)
-                    break
-            return count
+            def update(self, n: int) -> None:
+                flushes.append(n)
+                stop["flag"] = True
 
-        with mock.patch("bitbrew._chunked_write", side_effect=interrupting_write):
-            ret = main(["-p", "a*", "--charset", "abcde", "-o", outfile])
+        def endless():
+            i = 0
+            while True:
+                yield f"w{i}"
+                i += 1
 
-        assert ret == 130
-        # The partial file should have been removed
+        with pytest.raises(KeyboardInterrupt):
+            _chunked_write(
+                endless(), buf, chunk_size=100,
+                progress=TripOnFirstFlush(), should_stop=lambda: stop["flag"],
+            )
+        # Stopped at the first poll after the first chunk, not run forever.
+        assert flushes == [100]
+
+    def test_should_stop_none_writes_everything(self) -> None:
+        """Omitting should_stop keeps the original write-to-completion behaviour."""
+        buf = io.StringIO()
+        total = _chunked_write(["a", "b", "c"], buf, chunk_size=2, should_stop=None)
+        assert total == 3
+        assert buf.getvalue() == "a\nb\nc\n"
+
+    def test_real_sigint_stops_generation_and_removes_partial(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """A genuine SIGINT must abort generation promptly and leave no output.
+
+        This runs the real _chunked_write in a real process: mocking it out is
+        what previously hid the fact that the interrupt flag was never polled.
+        """
+        outfile = os.path.join(str(tmp_path), "big.txt")
+        # 26^7 words: cannot complete, so any exit is the interrupt working.
+        proc = subprocess.Popen(
+            [sys.executable, BITBREW_PY, "-p", "*******", "--charset", "lower",
+             "--force", "-o", outfile],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        time.sleep(1.5)  # let it get well into the run
+        assert proc.poll() is None, "an 8e9-word run should not finish this fast"
+
+        proc.send_signal(signal.SIGINT)
+        try:
+            _, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            pytest.fail("SIGINT did not stop generation within 30s")
+
+        assert proc.returncode == 130
+        assert "Interrupted" in stderr
         assert not os.path.exists(outfile)
+        assert not os.path.exists(outfile + ".part")
 
-    def test_interrupt_returns_130(self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]") -> None:
-        """Interrupted execution should return exit code 130."""
-        outfile = str(tmp_path / "int.txt")
+    def test_interrupt_returns_130(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """A KeyboardInterrupt out of the writer surfaces as exit code 130."""
+        outfile = os.path.join(str(tmp_path), "int.txt")
 
-        def raise_interrupt(words, file_obj, chunk_size, progress=None):
+        def raise_interrupt(words, file_obj, chunk_size, progress=None, should_stop=None):
             raise KeyboardInterrupt
 
         with mock.patch("bitbrew._chunked_write", side_effect=raise_interrupt):
             ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
 
         assert ret == 130
-        stderr = capsys.readouterr().err
-        assert "Interrupted" in stderr
+        assert "Interrupted" in capsys.readouterr().err
+        assert not os.path.exists(outfile)
+        assert not os.path.exists(outfile + ".part")
 
     def test_interrupt_restores_old_handler(self, tmp_path: "os.PathLike[str]") -> None:
-        """After interrupt handling, the original SIGINT handler should be restored."""
-        outfile = str(tmp_path / "restore.txt")
+        """After interrupt handling, the original SIGINT handler is restored."""
+        outfile = os.path.join(str(tmp_path), "restore.txt")
         old_handler = signal.getsignal(signal.SIGINT)
 
-        def raise_interrupt(words, file_obj, chunk_size, progress=None):
+        def raise_interrupt(words, file_obj, chunk_size, progress=None, should_stop=None):
             raise KeyboardInterrupt
 
         with mock.patch("bitbrew._chunked_write", side_effect=raise_interrupt):
             main(["-p", "a*", "--charset", "xy", "-o", outfile])
 
-        current_handler = signal.getsignal(signal.SIGINT)
-        assert current_handler is old_handler
+        assert signal.getsignal(signal.SIGINT) is old_handler
 
     def test_stdout_keyboard_interrupt(self, capsys: pytest.CaptureFixture[str]) -> None:
         """KeyboardInterrupt on stdout path should return 0 gracefully."""
-        # Patch print to raise KeyboardInterrupt after first word
         call_count = 0
         original_print = print
 
@@ -414,6 +458,101 @@ class TestInterruptCleanup:
         with mock.patch("builtins.print", side_effect=interrupting_print):
             ret = main(["-p", "a*", "--charset", "xy"])
         assert ret == 0
+
+
+class TestAtomicOutput:
+    """Output must appear at its final path only once fully written."""
+
+    def test_oserror_leaves_no_partial_file(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """A mid-write OSError must clean up rather than leave a truncated file."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+
+        def boom(words, file_obj, chunk_size, progress=None, should_stop=None):
+            file_obj.write("aa\nbb\n")
+            raise OSError("disk full")
+
+        with mock.patch("bitbrew._chunked_write", side_effect=boom):
+            ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
+
+        assert ret == 1
+        assert "could not write" in capsys.readouterr().err
+        assert not os.path.exists(outfile), "truncated wordlist left at output path"
+        assert not os.path.exists(outfile + ".part")
+
+    def test_success_leaves_no_part_file(self, tmp_path: "os.PathLike[str]") -> None:
+        """A successful run renames the sidecar away."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
+        assert ret == 0
+        assert os.path.exists(outfile)
+        assert not os.path.exists(outfile + ".part")
+
+
+class TestDedupPolicy:
+    """Deduplication is only paid for when duplicates are actually possible."""
+
+    def test_single_star_pattern_needs_no_dedup(self) -> None:
+        assert _needs_dedup(["pass*"]) is False
+        assert _needs_dedup(["******"]) is False
+
+    def test_single_optional_pattern_needs_dedup(self) -> None:
+        # '??' over 'x' yields 'x' two different ways.
+        assert _needs_dedup(["??"]) is True
+        assert _needs_dedup(["?x?"]) is True
+
+    def test_multiple_patterns_always_need_dedup(self) -> None:
+        assert _needs_dedup(["a*", "b*"]) is True
+
+    def test_optional_pattern_is_still_deduplicated(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Default behaviour still removes the duplicate '?' collapses."""
+        ret = main(["-p", "??", "--charset", "x", "--count"])
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == "3"  # "", "x", "xx"
+
+    def test_no_dedup_flag_keeps_duplicates(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--no-dedup streams the raw expansion, duplicates included."""
+        ret = main(["-p", "??", "--charset", "x", "--count", "--no-dedup"])
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == "4"  # "", "x", "x", "xx"
+
+    def test_no_dedup_warning_below_threshold(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Small deduplicated runs stay quiet."""
+        ret = main(["-p", "a*", "-p", "b*", "--charset", "lower", "--count"])
+        assert ret == 0
+        assert "holds them all in memory" not in capsys.readouterr().err
+
+    def test_dedup_memory_warning_above_threshold(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Deduplicated runs past the threshold warn that memory scales with output.
+
+        The threshold is lowered rather than generating a genuinely large run:
+        materialising millions of words here would reproduce the very pathology
+        the warning exists to flag.
+        """
+        monkeypatch.setattr("bitbrew._DEDUP_WARN_THRESHOLD", 10)
+        ret = main(["-p", "a*", "-p", "b*", "--charset", "lower", "--count"])
+        assert ret == 0
+        stderr = capsys.readouterr().err
+        assert "holds them all in memory" in stderr
+        assert "--no-dedup" in stderr
+
+    def test_no_warning_when_dedup_is_skipped(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A single '*'-only pattern never deduplicates, so it never warns."""
+        monkeypatch.setattr("bitbrew._DEDUP_WARN_THRESHOLD", 10)
+        ret = main(["-p", "***", "--charset", "lower", "--count"])
+        assert ret == 0
+        assert "holds them all in memory" not in capsys.readouterr().err
 
 
 class TestStressAndPerformance:

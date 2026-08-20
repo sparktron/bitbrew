@@ -23,7 +23,7 @@ import os
 import re
 import signal
 import sys
-from typing import Generator, Iterable, Optional
+from typing import Callable, Generator, Iterable, Optional
 
 CHARSETS = {
     "lower": "abcdefghijklmnopqrstuvwxyz",
@@ -64,6 +64,8 @@ def resolve_charset(spec: str) -> str:
 
 
 _MAX_ESTIMATE = 10**15  # cap to prevent unbounded memory/time
+_DEDUP_WARN_THRESHOLD = 1_000_000  # warn above this when dedup is in play
+_BYTES_PER_WORD = 100  # measured cost of holding one short word in a set
 
 
 def estimate_count(pattern: str, charset_len: int) -> int:
@@ -237,11 +239,15 @@ def _deduplicated(words: Iterable[str]) -> Generator[str, None, None]:
             yield word
 
 
+_STOP_CHECK_INTERVAL = 10_000  # words between should_stop() polls
+
+
 def _chunked_write(
     words: Iterable[str],
     file_obj: "gzip.GzipFile | io.TextIOBase | io.StringIO",
     chunk_size: int,
     progress: Optional[object] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> int:
     """Write words to a file in chunks.
 
@@ -250,29 +256,94 @@ def _chunked_write(
         file_obj: File object to write to (text-mode or binary gzip).
         chunk_size: Number of words per chunk.
         progress: Optional tqdm progress bar to update.
+        should_stop: Optional predicate polled every _STOP_CHECK_INTERVAL words
+            (or every chunk, whichever is smaller). When it returns True the
+            write is abandoned.
 
     Returns:
         Total number of words written.
+
+    Raises:
+        KeyboardInterrupt: If should_stop() returns True mid-write.
     """
     is_binary = isinstance(file_obj, gzip.GzipFile)
     total = 0
     buf: list[str] = []
-    for word in words:
-        buf.append(word)
-        if len(buf) >= chunk_size:
-            data = "\n".join(buf) + "\n"
-            file_obj.write(data.encode() if is_binary else data)
-            if progress is not None:
-                progress.update(len(buf))
-            total += len(buf)
-            buf.clear()
-    if buf:
+
+    def flush() -> None:
+        nonlocal total
         data = "\n".join(buf) + "\n"
         file_obj.write(data.encode() if is_binary else data)
         if progress is not None:
             progress.update(len(buf))
         total += len(buf)
+        buf.clear()
+
+    check_every = min(chunk_size, _STOP_CHECK_INTERVAL)
+    since_check = 0
+    for word in words:
+        buf.append(word)
+        if len(buf) >= chunk_size:
+            flush()
+        since_check += 1
+        if since_check >= check_every:
+            since_check = 0
+            if should_stop is not None and should_stop():
+                raise KeyboardInterrupt
+    if buf:
+        flush()
     return total
+
+
+def _needs_dedup(patterns: list[str]) -> bool:
+    """Report whether a pattern set can emit the same word twice.
+
+    Deduplication costs memory proportional to the output size, so it is only
+    worth paying when duplicates are actually possible:
+
+    * Several patterns can always overlap each other.
+    * A single pattern containing '?' can collapse to the same word two ways
+      (e.g. '??' over 'x' yields 'x' twice), so it needs deduplication.
+    * A single pattern of literals and '*' cannot: itertools.product over a
+      deduplicated charset gives distinct combinations at fixed positions.
+
+    Args:
+        patterns: The patterns supplied on the command line.
+
+    Returns:
+        True if the output stream must be deduplicated.
+    """
+    if len(patterns) > 1:
+        return True
+    return "?" in patterns[0]
+
+
+def _human_bytes(size: float) -> str:
+    """Format a byte count using the largest unit that keeps it readable.
+
+    Args:
+        size: Number of bytes.
+
+    Returns:
+        A string such as "95.4 MiB".
+    """
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    raise AssertionError("unreachable")
+
+
+def _remove_if_exists(path: str) -> None:
+    """Delete a file, ignoring the case where it was never created.
+
+    Args:
+        path: Filesystem path to remove.
+    """
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -316,6 +387,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--overwrite", action="store_true",
         help="Overwrite output file if it already exists.",
+    )
+    parser.add_argument(
+        "--no-dedup", action="store_true",
+        help="Stream without deduplicating. Deduplication holds every emitted "
+             "word in memory; disable it for very large runs.",
     )
     return parser
 
@@ -408,7 +484,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         for pattern in args.pattern:
             yield from _expand_pattern(pattern, charset)
 
-    words = _deduplicated(word_pipeline())
+    words: Iterable[str] = word_pipeline()
+    if not args.no_dedup and _needs_dedup(args.pattern):
+        if total_estimate > _DEDUP_WARN_THRESHOLD:
+            print(
+                f"Warning: deduplicating ~{total_estimate:,} words holds them all in "
+                f"memory (roughly {_human_bytes(total_estimate * _BYTES_PER_WORD)}). "
+                f"Use --no-dedup to stream instead.",
+                file=sys.stderr,
+            )
+        words = _deduplicated(words)
     words = _apply_filters(words, args.min_len, args.max_len, regex)
 
     # Count-only mode
@@ -428,8 +513,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         old_handler = signal.signal(signal.SIGINT, _handle_interrupt)
 
+        # Build into a sidecar file and rename on success, so an interrupted
+        # or failed run never leaves a truncated wordlist at output_path.
+        temp_path = output_path + ".part"
+        progress = None
         try:
-            progress = None
             try:
                 import tqdm as tqdm_mod
                 progress = tqdm_mod.tqdm(total=total_estimate, unit="words", desc="Generating")
@@ -437,30 +525,37 @@ def main(argv: Optional[list[str]] = None) -> int:
                 pass
 
             if use_compress:
-                with gzip.open(output_path, "wb") as f:
-                    written = _chunked_write(words, f, args.chunk_size, progress)
+                with gzip.open(temp_path, "wb") as f:
+                    written = _chunked_write(
+                        words, f, args.chunk_size, progress, lambda: interrupted
+                    )
             else:
-                with open(output_path, "w", encoding="utf-8") as f:
-                    written = _chunked_write(words, f, args.chunk_size, progress)
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    written = _chunked_write(
+                        words, f, args.chunk_size, progress, lambda: interrupted
+                    )
 
             if progress is not None:
                 progress.close()
 
+            # A signal can still land between the last poll and here.
             if interrupted:
                 raise KeyboardInterrupt
 
+            os.replace(temp_path, output_path)
             print(f"Wrote {written:,} words to {output_path}", file=sys.stderr)
 
         except KeyboardInterrupt:
-            # Clean up partial file
-            if os.path.exists(output_path):
-                os.remove(output_path)
+            _remove_if_exists(temp_path)
             print("\nInterrupted. Partial output file removed.", file=sys.stderr)
             return 130
         except OSError as e:
+            _remove_if_exists(temp_path)
             print(f"Error: could not write to '{output_path}': {e}", file=sys.stderr)
             return 1
         finally:
+            if progress is not None:
+                progress.close()
             signal.signal(signal.SIGINT, old_handler)
     else:
         # Write to stdout

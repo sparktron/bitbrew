@@ -15,11 +15,11 @@
 - 🔣 **Wildcard patterns** — `*` for exactly one char, `?` for zero-or-one char
 - 🔡 **Flexible charsets** — built-in presets, comma-combined, or raw custom strings
 - 📁 **Streaming output** — write to stdout, a file, or gzip-compressed output
-- 🔍 **Filtering** — by minimum/maximum length and/or regex (with ReDoS protection)
-- 🔂 **Multiple patterns** — supply `-p` multiple times; results are automatically deduplicated
+- 🔍 **Filtering** — by minimum/maximum length and/or regex (with partial ReDoS screening)
+- 🔂 **Multiple patterns** — supply `-p` multiple times; results are deduplicated by default
 - 🔢 **Count mode** — preview how many words will be generated without outputting them
 - 📊 **Progress bar** — optional `tqdm` integration for large runs
-- 🛡️ **Safety rails** — `--force` for >10 M combinations, `--overwrite` for existing files
+- 🛡️ **Safety rails** — `--force` for >10 M combinations, `--overwrite` for existing files, atomic writes so a failed run never leaves a truncated wordlist
 - 🐍 **Library API** — use `generate_wordlist()` directly in your own code
 
 ---
@@ -143,7 +143,11 @@ bitbrew -p "a?b?c" --charset digits --min-len 4 --max-len 5
 bitbrew -p "***" --charset "lower,digits" --filter "^a.*9$"
 ```
 
-> 🛡️ **ReDoS protection:** bitbrew checks your `--filter` regex for nested quantifiers (e.g. `(a+)+`) that could cause catastrophic backtracking, and rejects them with a clear error message.
+> ⚠️ **Partial ReDoS screening:** bitbrew rejects `--filter` regexes containing nested
+> quantifiers (e.g. `(a+)+`), one common source of catastrophic backtracking. This is a
+> heuristic, **not a guarantee**: it does not catch overlapping alternation such as
+> `(a|a)+`, and it rejects some patterns that are actually safe, like `(ab+c)+`. Do not
+> rely on it as a security boundary for regexes from an untrusted source.
 
 ---
 
@@ -153,6 +157,17 @@ Supply `-p` more than once. Results across all patterns are automatically **dedu
 
 ```bash
 bitbrew -p "admin*" -p "root*" --charset digits -o wordlist.txt
+```
+
+Deduplication is the one part of the pipeline that is not constant-memory — it has to
+remember every word it has emitted (roughly 100 bytes each). bitbrew therefore only
+deduplicates when duplicates are actually **possible**: more than one `-p`, or a single
+pattern containing `?`. A plain `bitbrew -p "******"` run skips it entirely and streams in
+constant memory. When dedup is unavoidable and the run is large, bitbrew warns you and
+you can stream without it:
+
+```bash
+bitbrew -p "admin*" -p "root*" --charset all --force --no-dedup -o wordlist.txt
 ```
 
 ---
@@ -175,24 +190,37 @@ Count mode respects `--min-len`, `--max-len`, and `--filter`.
 Generating more than **10 million** combinations requires `--force`:
 
 ```bash
-bitbrew -p "******" --charset lower --force -o big.txt
+# 26^5 = 11,881,376 words, about 68 MB on disk
+bitbrew -p "*****" --charset lower --force -o big.txt
 ```
+
+Check the size before you commit to it — `--count` and the `--force` warning both tell you
+what you are about to generate. Each extra `*` multiplies the output by the charset size:
+`-p "******"` over `lower` is 308 million words and roughly 2 GB of text.
 
 Control the streaming buffer size with `--chunk-size` (default: 10,000 words):
 
 ```bash
-bitbrew -p "******" --charset lower --force -o big.txt --chunk-size 50000
+bitbrew -p "*****" --charset lower --force -o big.txt --chunk-size 50000
 ```
 
 **Optional progress bar** — install `tqdm` and bitbrew will display a live progress counter automatically when writing to a file:
 
 ```bash
 pip install tqdm
-bitbrew -p "******" --charset lower --force -o big.txt
-# Generating: 100%|████████████| 308M/308M [02:14<00:00, 2.29Mwords/s]
+bitbrew -p "*****" --charset lower --force -o big.txt
+# Generating: 100%|████████████| 11.9M/11.9M [00:04<00:00, 2.54Mwords/s]
 ```
 
-**Interrupted?** Pressing `Ctrl+C` during file output removes the partial file automatically and exits with code `130`.
+The progress total is the *estimated* expansion, so it runs ahead of the real count when
+`--min-len`, `--max-len`, or `--filter` discard words.
+
+**Interrupted?** Pressing `Ctrl+C` during file output stops generation promptly, removes
+the partial file, and exits with code `130`.
+
+**Atomic output:** bitbrew builds into a `<output>.part` sidecar and renames it into place
+only once the run completes. An interrupted or failed run — a full disk, a permissions
+error — leaves no truncated wordlist at your output path.
 
 ---
 
@@ -215,7 +243,7 @@ for word in generate_wordlist("pass**", "digits"):
     print(word)
 ```
 
-`generate_wordlist` is a **lazy generator** — it never materialises the full list in memory, making it safe for enormous pattern spaces.
+`generate_wordlist` is a **lazy generator** — it never materialises the full list in memory, making it safe for enormous pattern spaces. It performs no deduplication; that is a CLI concern, described under [Multiple patterns](#multiple-patterns) above.
 
 You can also access the lower-level helpers directly:
 
@@ -233,8 +261,9 @@ count   = estimate_count("****", len(charset))  # 1,679,616
 ```
 usage: bitbrew [-h] -p PATTERN [-o OUTPUT] [--charset CHARSET]
                [--min-len MIN_LEN] [--max-len MAX_LEN]
-               [--filter REGEX] [--count] [--compress]
+               [--filter REGEX_FILTER] [--count] [--compress]
                [--chunk-size CHUNK_SIZE] [--force] [--overwrite]
+               [--no-dedup]
 ```
 
 | Flag | Description |
@@ -250,6 +279,7 @@ usage: bitbrew [-h] -p PATTERN [-o OUTPUT] [--charset CHARSET]
 | `--chunk-size` | Words per streaming chunk (default: `10000`) |
 | `--force` | Allow >10 M combinations |
 | `--overwrite` | Overwrite an existing output file |
+| `--no-dedup` | Stream without deduplicating (constant memory, duplicates kept) |
 
 ---
 
@@ -264,8 +294,11 @@ The test suite covers:
 - Pattern expansion (including edge cases with `?` and mixed wildcards)
 - All CLI flags and error paths
 - Streaming / chunked writes (text and gzip)
-- Interrupt handling and partial file cleanup
-- ReDoS detection
+- Interrupt handling and partial file cleanup, including a real `SIGINT` delivered to a
+  live generation run
+- Atomic output: no truncated file is left behind on error or interrupt
+- Deduplication policy and `--no-dedup`
+- ReDoS screening
 - Large-pattern stress tests
 
 ---
