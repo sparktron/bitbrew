@@ -1,29 +1,50 @@
 """Tests for bitbrew.py."""
 
 import gzip
+import importlib.metadata
 import io
 import os
+import re
+import shutil
 import signal
+import stat
+import subprocess
+import sys
 import tempfile
-import threading
 import time
 import types
 from unittest import mock
 
 import pytest
 
+import bitbrew
 from bitbrew import (
+    _BLOOM_MAX_BYTES,
     _MAX_ESTIMATE,
     _apply_filters,
+    _BloomFilter,
     _check_regex_safety,
     _chunked_write,
     _deduplicated,
     _expand_pattern,
+    _needs_dedup,
+    _parse_pattern,
+    _probe_regex_blowup,
+    _resolve_options,
+    build_parser,
     estimate_count,
     generate_wordlist,
+    load_charset_file,
     main,
     resolve_charset,
 )
+
+BITBREW_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bitbrew.py")
+
+
+def _sidecars(directory: "os.PathLike[str] | str") -> list[str]:
+    """Leftover .part sidecar files in a directory."""
+    return [name for name in os.listdir(str(directory)) if name.endswith(".part")]
 
 
 class TestResolveCharset:
@@ -173,7 +194,8 @@ class TestCLI:
         outfile = str(tmp_path / "words.txt")
         ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
         assert ret == 0
-        content = open(outfile).read().strip().split("\n")
+        with open(outfile) as f:
+            content = f.read().strip().split("\n")
         assert sorted(content) == ["ax", "ay"]
 
     def test_gz_output(self, tmp_path: "os.PathLike[str]") -> None:
@@ -319,88 +341,136 @@ class TestGzipCorruptionAndPermissionErrors:
         # Corrupt the file by truncating it
         with open(gz_path, "r+b") as f:
             f.truncate(5)
-        with pytest.raises((gzip.BadGzipFile, EOFError)):
-            with gzip.open(gz_path, "rt") as f:
-                f.read()
+        with pytest.raises((gzip.BadGzipFile, EOFError)), gzip.open(gz_path, "rt") as f:
+            f.read()
 
-    def test_write_permission_error(self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]") -> None:
+    def test_write_permission_error(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
         """Writing to an unwritable path should return 1 with an error message."""
         outfile = str(tmp_path / "words.txt")
-        with mock.patch("builtins.open", side_effect=PermissionError("Permission denied")):
+        # Creating the sidecar is the first thing that touches the filesystem.
+        with mock.patch(
+            "bitbrew.tempfile.mkstemp", side_effect=PermissionError("Permission denied")
+        ):
             ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
         assert ret == 1
-        stderr = capsys.readouterr().err
-        assert "could not write" in stderr
+        assert "could not write" in capsys.readouterr().err
+        assert not os.path.exists(outfile)
 
-    def test_gz_write_error(self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]") -> None:
-        """Gzip open failure should return 1 with an error message."""
+    def test_gz_write_error(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """Gzip stream failure should return 1 with an error message."""
         outfile = str(tmp_path / "words.gz")
-        with mock.patch("gzip.open", side_effect=OSError("disk full")):
+        with mock.patch("bitbrew.gzip.GzipFile", side_effect=OSError("disk full")):
             ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
         assert ret == 1
-        stderr = capsys.readouterr().err
-        assert "could not write" in stderr
+        assert "could not write" in capsys.readouterr().err
+        assert not os.path.exists(outfile)
+        assert not _sidecars(tmp_path)
 
 
 class TestInterruptCleanup:
-    """Tests for SIGINT handler and partial file cleanup."""
+    """Tests for SIGINT handling, partial file cleanup, and atomic rename."""
 
-    def test_interrupt_removes_partial_file(self, tmp_path: "os.PathLike[str]") -> None:
-        """Ctrl+C during file write should remove the partial output file."""
-        outfile = str(tmp_path / "partial.txt")
+    def test_should_stop_aborts_write_loop(self) -> None:
+        """_chunked_write must poll should_stop and abandon an endless stream."""
+        buf = io.StringIO()
+        stop = {"flag": False}
+        flushes = []
 
-        # Patch _chunked_write to simulate an interrupt mid-write
-        original_chunked_write = _chunked_write
+        class TripOnFirstFlush:
+            """Stands in for tqdm; trips the stop flag when a chunk lands."""
 
-        def interrupting_write(words, file_obj, chunk_size, progress=None):
-            # Write some data then send SIGINT to ourselves
-            count = 0
-            for word in words:
-                file_obj.write(word + "\n")
-                count += 1
-                if count >= 1:
-                    os.kill(os.getpid(), signal.SIGINT)
-                    break
-            return count
+            def update(self, n: int) -> None:
+                flushes.append(n)
+                stop["flag"] = True
 
-        with mock.patch("bitbrew._chunked_write", side_effect=interrupting_write):
-            ret = main(["-p", "a*", "--charset", "abcde", "-o", outfile])
+        def endless():
+            i = 0
+            while True:
+                yield f"w{i}"
+                i += 1
 
-        assert ret == 130
-        # The partial file should have been removed
+        with pytest.raises(KeyboardInterrupt):
+            _chunked_write(
+                endless(), buf, chunk_size=100,
+                progress=TripOnFirstFlush(), should_stop=lambda: stop["flag"],
+            )
+        # Stopped at the first poll after the first chunk, not run forever.
+        assert flushes == [100]
+
+    def test_should_stop_none_writes_everything(self) -> None:
+        """Omitting should_stop keeps the original write-to-completion behaviour."""
+        buf = io.StringIO()
+        total = _chunked_write(["a", "b", "c"], buf, chunk_size=2, should_stop=None)
+        assert total == 3
+        assert buf.getvalue() == "a\nb\nc\n"
+
+    def test_real_sigint_stops_generation_and_removes_partial(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """A genuine SIGINT must abort generation promptly and leave no output.
+
+        This runs the real _chunked_write in a real process: mocking it out is
+        what previously hid the fact that the interrupt flag was never polled.
+        """
+        outfile = os.path.join(str(tmp_path), "big.txt")
+        # 26^7 words: cannot complete, so any exit is the interrupt working.
+        proc = subprocess.Popen(
+            [sys.executable, BITBREW_PY, "-p", "*******", "--charset", "lower",
+             "--force", "-o", outfile],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        time.sleep(1.5)  # let it get well into the run
+        assert proc.poll() is None, "an 8e9-word run should not finish this fast"
+
+        proc.send_signal(signal.SIGINT)
+        try:
+            _, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            pytest.fail("SIGINT did not stop generation within 30s")
+
+        assert proc.returncode == 130
+        assert "Interrupted" in stderr
         assert not os.path.exists(outfile)
+        assert not _sidecars(tmp_path)
 
-    def test_interrupt_returns_130(self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]") -> None:
-        """Interrupted execution should return exit code 130."""
-        outfile = str(tmp_path / "int.txt")
+    def test_interrupt_returns_130(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """A KeyboardInterrupt out of the writer surfaces as exit code 130."""
+        outfile = os.path.join(str(tmp_path), "int.txt")
 
-        def raise_interrupt(words, file_obj, chunk_size, progress=None):
+        def raise_interrupt(words, file_obj, chunk_size, progress=None, should_stop=None):
             raise KeyboardInterrupt
 
         with mock.patch("bitbrew._chunked_write", side_effect=raise_interrupt):
             ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
 
         assert ret == 130
-        stderr = capsys.readouterr().err
-        assert "Interrupted" in stderr
+        assert "Interrupted" in capsys.readouterr().err
+        assert not os.path.exists(outfile)
+        assert not _sidecars(tmp_path)
 
     def test_interrupt_restores_old_handler(self, tmp_path: "os.PathLike[str]") -> None:
-        """After interrupt handling, the original SIGINT handler should be restored."""
-        outfile = str(tmp_path / "restore.txt")
+        """After interrupt handling, the original SIGINT handler is restored."""
+        outfile = os.path.join(str(tmp_path), "restore.txt")
         old_handler = signal.getsignal(signal.SIGINT)
 
-        def raise_interrupt(words, file_obj, chunk_size, progress=None):
+        def raise_interrupt(words, file_obj, chunk_size, progress=None, should_stop=None):
             raise KeyboardInterrupt
 
         with mock.patch("bitbrew._chunked_write", side_effect=raise_interrupt):
             main(["-p", "a*", "--charset", "xy", "-o", outfile])
 
-        current_handler = signal.getsignal(signal.SIGINT)
-        assert current_handler is old_handler
+        assert signal.getsignal(signal.SIGINT) is old_handler
 
     def test_stdout_keyboard_interrupt(self, capsys: pytest.CaptureFixture[str]) -> None:
         """KeyboardInterrupt on stdout path should return 0 gracefully."""
-        # Patch print to raise KeyboardInterrupt after first word
         call_count = 0
         original_print = print
 
@@ -414,6 +484,101 @@ class TestInterruptCleanup:
         with mock.patch("builtins.print", side_effect=interrupting_print):
             ret = main(["-p", "a*", "--charset", "xy"])
         assert ret == 0
+
+
+class TestAtomicOutput:
+    """Output must appear at its final path only once fully written."""
+
+    def test_oserror_leaves_no_partial_file(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """A mid-write OSError must clean up rather than leave a truncated file."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+
+        def boom(words, file_obj, chunk_size, progress=None, should_stop=None):
+            file_obj.write("aa\nbb\n")
+            raise OSError("disk full")
+
+        with mock.patch("bitbrew._chunked_write", side_effect=boom):
+            ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
+
+        assert ret == 1
+        assert "could not write" in capsys.readouterr().err
+        assert not os.path.exists(outfile), "truncated wordlist left at output path"
+        assert not _sidecars(tmp_path)
+
+    def test_success_leaves_no_part_file(self, tmp_path: "os.PathLike[str]") -> None:
+        """A successful run renames the sidecar away."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
+        assert ret == 0
+        assert os.path.exists(outfile)
+        assert not _sidecars(tmp_path)
+
+
+class TestDedupPolicy:
+    """Deduplication is only paid for when duplicates are actually possible."""
+
+    def test_single_star_pattern_needs_no_dedup(self) -> None:
+        assert _needs_dedup(["pass*"]) is False
+        assert _needs_dedup(["******"]) is False
+
+    def test_single_optional_pattern_needs_dedup(self) -> None:
+        # '??' over 'x' yields 'x' two different ways.
+        assert _needs_dedup(["??"]) is True
+        assert _needs_dedup(["?x?"]) is True
+
+    def test_multiple_patterns_always_need_dedup(self) -> None:
+        assert _needs_dedup(["a*", "b*"]) is True
+
+    def test_optional_pattern_is_still_deduplicated(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Default behaviour still removes the duplicate '?' collapses."""
+        ret = main(["-p", "??", "--charset", "x", "--count"])
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == "3"  # "", "x", "xx"
+
+    def test_no_dedup_flag_keeps_duplicates(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--no-dedup streams the raw expansion, duplicates included."""
+        ret = main(["-p", "??", "--charset", "x", "--count", "--no-dedup"])
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == "4"  # "", "x", "x", "xx"
+
+    def test_no_dedup_warning_below_threshold(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Small deduplicated runs stay quiet."""
+        ret = main(["-p", "a*", "-p", "b*", "--charset", "lower", "--count"])
+        assert ret == 0
+        assert "holds them all in memory" not in capsys.readouterr().err
+
+    def test_dedup_memory_warning_above_threshold(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Deduplicated runs past the threshold warn that memory scales with output.
+
+        The threshold is lowered rather than generating a genuinely large run:
+        materialising millions of words here would reproduce the very pathology
+        the warning exists to flag.
+        """
+        monkeypatch.setattr("bitbrew._DEDUP_WARN_THRESHOLD", 10)
+        ret = main(["-p", "a*", "-p", "b*", "--charset", "lower", "--count"])
+        assert ret == 0
+        stderr = capsys.readouterr().err
+        assert "holds them all in memory" in stderr
+        assert "--no-dedup" in stderr
+
+    def test_no_warning_when_dedup_is_skipped(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A single '*'-only pattern never deduplicates, so it never warns."""
+        monkeypatch.setattr("bitbrew._DEDUP_WARN_THRESHOLD", 10)
+        ret = main(["-p", "***", "--charset", "lower", "--count"])
+        assert ret == 0
+        assert "holds them all in memory" not in capsys.readouterr().err
 
 
 class TestStressAndPerformance:
@@ -452,12 +617,16 @@ class TestStressAndPerformance:
     def test_large_pattern_with_filters(self, capsys: pytest.CaptureFixture[str]) -> None:
         """Filters should work correctly even with large pattern spaces."""
         # Generate ab,ac,...,zz with min_len=2, max_len=2 (all pass for **)
-        ret = main(["-p", "**", "--charset", "digits", "--min-len", "2", "--max-len", "2", "--count"])
+        ret = main(
+            ["-p", "**", "--charset", "digits", "--min-len", "2", "--max-len", "2", "--count"]
+        )
         assert ret == 0
         output = capsys.readouterr().out.strip()
         assert output == "100"  # 10 * 10
 
-    def test_deduplicate_large_overlapping_patterns(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_deduplicate_large_overlapping_patterns(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         """Deduplication should handle heavily overlapping multi-pattern input."""
         ret = main(["-p", "a*", "-p", "a*", "-p", "a*", "--charset", "xy", "--count"])
         assert ret == 0
@@ -555,14 +724,16 @@ class TestAuditFixes:
         stderr = capsys.readouterr().err
         assert "directory" in stderr and "does not exist" in stderr
 
-    def test_oserror_during_write(self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]") -> None:
+    def test_oserror_during_write(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
         """OSError during file write should return 1 with a message, not crash."""
         outfile = str(tmp_path / "words.txt")
-        with mock.patch("builtins.open", side_effect=OSError("disk full")):
+        with mock.patch("bitbrew.tempfile.mkstemp", side_effect=OSError("disk full")):
             ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
         assert ret == 1
-        stderr = capsys.readouterr().err
-        assert "could not write" in stderr
+        assert "could not write" in capsys.readouterr().err
+        assert not os.path.exists(outfile)
 
     def test_estimate_count_capped(self) -> None:
         """estimate_count should cap at _MAX_ESTIMATE for huge patterns."""
@@ -584,3 +755,583 @@ class TestAuditFixes:
         with gzip.open(outfile, "rt") as f:
             content = f.read().strip().split("\n")
         assert sorted(content) == ["ax", "ay"]
+
+
+class TestRegexBlowupProbe:
+    """The timing probe catches backtracking the structural check misses."""
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [r"(a|a)+$", r"(a|b|ab)*$", r"(a|aa)+$", r"(a+)+$", r"([a-z]+)*$", r"((a)*)*$"],
+    )
+    def test_catastrophic_patterns_are_probed_out(self, pattern: str) -> None:
+        """Each of these blows up exponentially and must be rejected."""
+        assert _probe_regex_blowup(re.compile(pattern), pattern) is not None
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [r"^abc$", r"\d+", r"[a-z]+", r"(foo|bar)", r"a{2,5}", r"^a.*9$",
+         r"(ab+c)+", r"\(a+\)+", r"^[a-z]{3}\d$", r"pass\d+", r"(cat|dog)s?$",
+         r"(a|ab)+$", r".*"],
+    )
+    def test_safe_patterns_pass_the_probe(self, pattern: str) -> None:
+        """Linear-time patterns must not be flagged."""
+        assert _probe_regex_blowup(re.compile(pattern), pattern) is None
+
+    def test_probe_is_time_bounded(self) -> None:
+        """Screening a pathological pattern must itself finish quickly."""
+        pattern = r"(a*)*$"
+        start = time.perf_counter()
+        assert _probe_regex_blowup(re.compile(pattern), pattern) is not None
+        assert time.perf_counter() - start < 2.0
+
+    def test_probe_overhead_on_safe_pattern_is_negligible(self) -> None:
+        """The common case -- a safe filter -- must not cost real time."""
+        start = time.perf_counter()
+        assert _probe_regex_blowup(re.compile(r"^a.*9$"), r"^a.*9$") is None
+        assert time.perf_counter() - start < 0.05
+
+    def test_alternation_redos_rejected_by_cli(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """(a|a)+$ used to be accepted and would hang; now it is refused."""
+        ret = main(["-p", "a*", "--charset", "ab", "--filter", r"(a|a)+$"])
+        assert ret == 1
+        stderr = capsys.readouterr().err
+        assert "unsafe regex" in stderr
+        assert "backtracking" in stderr
+
+    def test_escaped_parens_are_not_a_group(self) -> None:
+        """'\\(a+\\)+' is literal parens, not a quantified group: no false positive."""
+        assert _check_regex_safety(r"\(a+\)+") is None
+
+    def test_allow_unsafe_regex_overrides_static_check(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The screening is a heuristic, so it must be overridable."""
+        ret = main(["-p", "a*", "--charset", "xy", "--filter", r"(ab+c)+"])
+        assert ret == 1  # false positive from the structural check
+
+        ret = main(["-p", "*at", "--charset", "bcr", "--filter", r"(ca+t)+",
+                    "--allow-unsafe-regex"])
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == "cat"
+
+
+class TestCompressToStdout:
+    """--compress used to be silently ignored when writing to stdout."""
+
+    def test_compress_to_pipe_emits_real_gzip(self) -> None:
+        """Piping --compress output must yield decompressible gzip data."""
+        proc = subprocess.run(
+            [sys.executable, BITBREW_PY, "-p", "a*", "--charset", "xy", "--compress"],
+            capture_output=True, check=True,
+        )
+        assert proc.stdout[:2] == b"\x1f\x8b", "not gzip data"
+        assert sorted(gzip.decompress(proc.stdout).decode().split()) == ["ax", "ay"]
+
+    def test_compress_to_terminal_is_refused(
+        self, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Binary down a TTY is noise, so it is an error rather than a mess."""
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+        ret = main(["-p", "a*", "--charset", "xy", "--compress"])
+        assert ret == 1
+        assert "refusing to write compressed output to a terminal" in capsys.readouterr().err
+
+    def test_uncompressed_stdout_unaffected(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(["-p", "a*", "--charset", "xy"])
+        assert ret == 0
+        assert sorted(capsys.readouterr().out.split()) == ["ax", "ay"]
+
+
+class TestLengthValidation:
+    """Negative lengths used to be accepted and silently emit nothing."""
+
+    def test_negative_max_len_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ret = main(["-p", "a*", "--charset", "xy", "--max-len", "-1"])
+        assert ret == 1
+        assert "--max-len must be zero or greater" in capsys.readouterr().err
+
+    def test_negative_min_len_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ret = main(["-p", "a*", "--charset", "xy", "--min-len", "-5"])
+        assert ret == 1
+        assert "--min-len must be zero or greater" in capsys.readouterr().err
+
+    def test_zero_min_len_allowed(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Zero is a meaningful floor and must still work."""
+        ret = main(["-p", "a?", "--charset", "x", "--min-len", "0", "--count"])
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == "2"  # "a", "ax"
+
+
+class _FakeTqdm:
+    """Records the kwargs bitbrew builds its progress bar with."""
+
+    last: "dict[str, object]" = {}
+
+    def __init__(self, **kwargs: object) -> None:
+        _FakeTqdm.last = kwargs
+
+    def update(self, n: int) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class TestProgressTotal:
+    """The bar must not promise a total the run cannot reach."""
+
+    @pytest.fixture(autouse=True)
+    def _fake_tqdm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setitem(sys.modules, "tqdm", types.SimpleNamespace(tqdm=_FakeTqdm))
+        _FakeTqdm.last = {}
+
+    def test_exact_run_gets_a_real_total(self, tmp_path: "os.PathLike[str]") -> None:
+        """No filters, no dedup: the estimate is the true count."""
+        out = os.path.join(str(tmp_path), "w.txt")
+        assert main(["-p", "a*", "--charset", "xy", "-o", out]) == 0
+        assert _FakeTqdm.last["total"] == 2
+
+    def test_filtered_run_gets_no_total(self, tmp_path: "os.PathLike[str]") -> None:
+        """Filters drop words, so a total would never be reached."""
+        out = os.path.join(str(tmp_path), "w.txt")
+        assert main(["-p", "a*", "--charset", "xy", "-o", out, "--min-len", "2"]) == 0
+        assert _FakeTqdm.last["total"] is None
+
+    def test_deduplicated_run_gets_no_total(self, tmp_path: "os.PathLike[str]") -> None:
+        """Dedup can drop words too."""
+        out = os.path.join(str(tmp_path), "w.txt")
+        assert main(["-p", "a*", "-p", "b*", "--charset", "xy", "-o", out]) == 0
+        assert _FakeTqdm.last["total"] is None
+
+    def test_saturated_estimate_gets_no_total(self, tmp_path: "os.PathLike[str]") -> None:
+        """A capped estimate is not a real number; show a counter instead."""
+        out = os.path.join(str(tmp_path), "w.txt")
+        with (
+            mock.patch("bitbrew.estimate_count", return_value=_MAX_ESTIMATE),
+            mock.patch("bitbrew._chunked_write", return_value=0),
+        ):
+            assert main(["-p", "a*", "--charset", "xy", "-o", out, "--force"]) == 0
+        assert _FakeTqdm.last["total"] is None
+
+
+class TestInstalledConsoleScript:
+    """The packaged entry point has broken twice before with no test to catch it."""
+
+    def test_console_script_runs(self) -> None:
+        exe = shutil.which("bitbrew")
+        if exe is None:
+            pytest.skip("bitbrew is not installed in this environment")
+        proc = subprocess.run([exe, "-p", "a*", "--charset", "xy"],
+                              capture_output=True, text=True, check=True)
+        assert sorted(proc.stdout.split()) == ["ax", "ay"]
+
+    def test_console_script_count(self) -> None:
+        exe = shutil.which("bitbrew")
+        if exe is None:
+            pytest.skip("bitbrew is not installed in this environment")
+        proc = subprocess.run([exe, "-p", "**", "--charset", "ab", "--count"],
+                              capture_output=True, text=True, check=True)
+        assert proc.stdout.strip() == "4"
+
+
+class TestPatternEscapes:
+    """A backslash makes the next character literal."""
+
+    def test_escaped_star_is_literal(self) -> None:
+        assert list(_expand_pattern(r"a\*b", "xy")) == ["a*b"]
+
+    def test_escaped_question_is_literal(self) -> None:
+        assert list(_expand_pattern(r"a\?b", "xy")) == ["a?b"]
+
+    def test_escaped_backslash_is_one_backslash(self) -> None:
+        assert list(_expand_pattern(r"a\\b", "xy")) == ["a\\b"]
+
+    def test_escape_and_wildcard_mix(self) -> None:
+        assert list(_expand_pattern(r"\**", "xy")) == ["*x", "*y"]
+
+    def test_dangling_backslash_is_an_error(self) -> None:
+        with pytest.raises(ValueError, match="dangling backslash"):
+            _parse_pattern("abc\\")
+
+    def test_estimate_ignores_escaped_wildcards(self) -> None:
+        """An escaped '*' contributes no combinations."""
+        assert estimate_count(r"a\*b", 26) == 1
+        assert estimate_count(r"a*b", 26) == 26
+        assert estimate_count(r"a\*b*", 26) == 26
+
+    def test_dedup_policy_ignores_escaped_optional(self) -> None:
+        """'\\?' is a literal, so it cannot collapse two ways."""
+        assert _needs_dedup([r"a\?b"]) is False
+        assert _needs_dedup([r"a?b"]) is True
+
+    def test_cli_emits_literal_wildcard(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ret = main(["-p", r"pw\*", "--charset", "digits"])
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == "pw*"
+
+    def test_cli_rejects_dangling_backslash(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(["-p", "abc\\", "--charset", "xy"])
+        assert ret == 1
+        assert "dangling backslash" in capsys.readouterr().err
+
+    def test_escaped_pattern_counts_as_literal_for_warning(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A fully escaped pattern has no wildcards and should say so."""
+        ret = main(["-p", r"\*\?", "--charset", "xy"])
+        assert ret == 0
+        assert "no wildcards" in capsys.readouterr().err
+
+
+class TestCharsetFile:
+    """--charset-file takes characters verbatim, unlike --charset."""
+
+    def test_comma_and_space_survive(self, tmp_path: "os.PathLike[str]") -> None:
+        """Both are unreachable through --charset."""
+        path = os.path.join(str(tmp_path), "cs.txt")
+        with open(path, "w") as handle:
+            handle.write("ab, c")
+        assert load_charset_file(path) == "ab, c"
+
+    def test_single_trailing_newline_ignored(self, tmp_path: "os.PathLike[str]") -> None:
+        path = os.path.join(str(tmp_path), "cs.txt")
+        with open(path, "w") as handle:
+            handle.write("abc\n")
+        assert load_charset_file(path) == "abc"
+
+    def test_duplicates_removed(self, tmp_path: "os.PathLike[str]") -> None:
+        path = os.path.join(str(tmp_path), "cs.txt")
+        with open(path, "w") as handle:
+            handle.write("aabbc")
+        assert load_charset_file(path) == "abc"
+
+    def test_cli_uses_the_file(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        path = os.path.join(str(tmp_path), "cs.txt")
+        with open(path, "w") as handle:
+            handle.write("a,")
+        ret = main(["-p", "*", "--charset-file", path])
+        assert ret == 0
+        assert capsys.readouterr().out.split("\n")[:2] == ["a", ","]
+
+    def test_conflicts_with_charset(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ret = main(["-p", "*", "--charset", "lower", "--charset-file", "/nope"])
+        assert ret == 1
+        assert "mutually exclusive" in capsys.readouterr().err
+
+    def test_missing_file_reports_clearly(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(["-p", "*", "--charset-file", "/no/such/charset.txt"])
+        assert ret == 1
+        assert "could not read --charset-file" in capsys.readouterr().err
+
+
+class TestLimit:
+    """--limit samples a pattern space without generating all of it."""
+
+    def test_limit_truncates_output(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ret = main(["-p", "***", "--charset", "lower", "--limit", "4"])
+        assert ret == 0
+        assert capsys.readouterr().out.split() == ["aaa", "aab", "aac", "aad"]
+
+    def test_limit_above_available_is_harmless(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(["-p", "a*", "--charset", "xy", "--limit", "99"])
+        assert ret == 0
+        assert sorted(capsys.readouterr().out.split()) == ["ax", "ay"]
+
+    def test_limit_must_be_positive(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ret = main(["-p", "a*", "--charset", "xy", "--limit", "0"])
+        assert ret == 1
+        assert "--limit must be greater than 0" in capsys.readouterr().err
+
+    def test_limit_lets_a_huge_space_be_sampled(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A limited sample of a 26^7 space must not need --force or real time."""
+        ret = main(["-p", "*******", "--charset", "lower", "--limit", "3"])
+        assert ret == 0
+        assert capsys.readouterr().out.split() == ["aaaaaaa", "aaaaaab", "aaaaaac"]
+
+
+class TestAnalyticCount:
+    """--count answers from arithmetic when nothing can drop a word."""
+
+    def test_huge_count_is_instant_and_needs_no_force(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        start = time.perf_counter()
+        ret = main(["-p", "*******", "--charset", "lower", "--count"])
+        elapsed = time.perf_counter() - start
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == str(26**7)
+        assert elapsed < 1.0, "count should not enumerate"
+
+    def test_analytic_count_matches_enumeration(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The shortcut must agree with actually counting."""
+        ret = main(["-p", "***", "--charset", "abc", "--count"])
+        assert ret == 0
+        analytic = capsys.readouterr().out.strip()
+        ret = main(["-p", "***", "--charset", "abc"])
+        assert ret == 0
+        assert analytic == str(len(capsys.readouterr().out.split()))
+
+    def test_filters_force_enumeration(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """With a filter the estimate is only an upper bound."""
+        ret = main(["-p", "a?", "--charset", "xy", "--min-len", "2", "--count"])
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == "2"
+
+    def test_dedup_forces_enumeration(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """'??' collapses, so arithmetic would overcount."""
+        ret = main(["-p", "??", "--charset", "x", "--count"])
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == "3"
+
+    def test_count_with_limit_is_analytic(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(["-p", "*******", "--charset", "lower", "--limit", "5", "--count"])
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == "5"
+
+    def test_generation_still_needs_force(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Counting is free, but actually emitting 8e9 words is not."""
+        ret = main(["-p", "*******", "--charset", "lower", "--count", "--no-dedup"])
+        assert ret == 0
+        ret = main(["-p", "*******", "--charset", "lower"])
+        assert ret == 1
+        assert "Use --force to proceed" in capsys.readouterr().err
+
+
+class TestBloomFilter:
+    """Approximate dedup trades a quantified error rate for bounded memory."""
+
+    @pytest.mark.parametrize("target", [1e-2, 1e-3])
+    def test_measured_error_rate_tracks_the_target(self, target: float) -> None:
+        """The whole feature rests on this number being honest."""
+        count = 50_000
+        bloom = _BloomFilter(count, target, _BLOOM_MAX_BYTES)
+        for i in range(count):
+            bloom.add_if_absent(f"item{i}")
+        # Query-only: adding the probes would load the filter past its capacity.
+        probes = 50_000
+        false_positives = sum(
+            1 for i in range(count, count + probes)
+            if bloom.probably_contains(f"item{i}")
+        )
+        measured = false_positives / probes
+        assert measured < target * 4, f"measured {measured:.2e} against target {target:.0e}"
+
+    def test_no_false_negatives(self) -> None:
+        """A word that was added is never reported absent -- that direction is exact."""
+        bloom = _BloomFilter(1000, 1e-3, _BLOOM_MAX_BYTES)
+        words = [f"w{i}" for i in range(1000)]
+        for word in words:
+            bloom.add_if_absent(word)
+        assert all(bloom.probably_contains(word) for word in words)
+
+    def test_add_if_absent_reports_first_sight(self) -> None:
+        bloom = _BloomFilter(100, 1e-3, _BLOOM_MAX_BYTES)
+        assert bloom.add_if_absent("hello") is True
+        assert bloom.add_if_absent("hello") is False
+
+    def test_memory_is_capped(self) -> None:
+        """A saturated estimate must not try to allocate the ideal size."""
+        bloom = _BloomFilter(10**12, 1e-9, max_bytes=1 << 20)
+        assert bloom.size_bytes <= 1 << 20
+        # The reported rate degrades honestly rather than staying at the target.
+        assert bloom.expected_error_rate > 1e-9
+
+    def test_cli_dedup_approx_removes_duplicates(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(["-p", "a*", "-p", "a*", "--charset", "lower",
+                    "--dedup-approx", "--count"])
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == "26"
+
+    def test_cli_dedup_approx_announces_its_cost(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        main(["-p", "a*", "-p", "b*", "--charset", "lower", "--dedup-approx", "--count"])
+        stderr = capsys.readouterr().err
+        assert "approximate deduplication" in stderr
+        assert "may be dropped" in stderr
+
+    def test_dedup_flags_are_mutually_exclusive(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(["-p", "a*", "-p", "b*", "--charset", "xy",
+                    "--no-dedup", "--dedup-approx"])
+        assert ret == 1
+        assert "mutually exclusive" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("rate", ["0", "1", "-0.5", "2"])
+    def test_error_rate_must_be_a_probability(
+        self, capsys: pytest.CaptureFixture[str], rate: str
+    ) -> None:
+        ret = main(["-p", "a*", "-p", "b*", "--charset", "xy",
+                    "--dedup-approx", "--dedup-error", rate])
+        assert ret == 1
+        assert "--dedup-error must be between 0 and 1" in capsys.readouterr().err
+
+
+class TestRunConfig:
+    """Option resolution is now a unit worth testing directly."""
+
+    def _config(self, *argv: str) -> object:
+        return _resolve_options(build_parser().parse_args(list(argv)))
+
+    def test_plain_run_has_an_exact_count(self) -> None:
+        cfg = self._config("-p", "***", "--charset", "abc")
+        assert cfg.exact_output_count == 27
+
+    def test_filtered_run_has_no_exact_count(self) -> None:
+        cfg = self._config("-p", "***", "--charset", "abc", "--min-len", "2")
+        assert cfg.exact_output_count is None
+
+    def test_dedup_run_has_no_exact_count(self) -> None:
+        cfg = self._config("-p", "a*", "-p", "b*", "--charset", "abc")
+        assert cfg.exact_output_count is None
+
+    def test_limit_caps_the_exact_count(self) -> None:
+        cfg = self._config("-p", "***", "--charset", "abc", "--limit", "5")
+        assert cfg.exact_output_count == 5
+
+    def test_gz_extension_implies_compression(self) -> None:
+        cfg = self._config("-p", "a*", "--charset", "xy", "-o", "/tmp/x.gz")
+        assert cfg.use_compress is True
+
+    def test_dedup_mode_selection(self) -> None:
+        assert self._config("-p", "a*", "--charset", "xy").dedup == "none"
+        assert self._config("-p", "a?", "--charset", "xy").dedup == "exact"
+        assert self._config("-p", "a*", "-p", "b*", "--charset", "xy").dedup == "exact"
+        assert self._config(
+            "-p", "a*", "-p", "b*", "--charset", "xy", "--dedup-approx"
+        ).dedup == "approx"
+        assert self._config(
+            "-p", "a*", "-p", "b*", "--charset", "xy", "--no-dedup"
+        ).dedup == "none"
+
+
+class TestVersionFlag:
+    def test_version_prints_and_exits_zero(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with pytest.raises(SystemExit) as excinfo:
+            main(["--version"])
+        assert excinfo.value.code == 0
+        assert capsys.readouterr().out.strip() == f"bitbrew {bitbrew.__version__}"
+
+    def test_version_matches_package_metadata(self) -> None:
+        """pyproject reads the version from the module, so they cannot drift."""
+        installed = importlib.metadata.version("bitbrew")
+        assert installed == bitbrew.__version__
+
+
+class TestReviewFindings:
+    """Regressions for defects found in review of this branch."""
+
+    def test_limit_with_filter_still_needs_force(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--limit bounds emitted words, not words examined.
+
+        A filter that matches nothing walks the whole space regardless of the
+        limit, so the guard has to keep asking about the full estimate.
+        """
+        ret = main(["-p", "*******", "--charset", "lower",
+                    "--filter", "^Z$", "--limit", "1"])
+        assert ret == 1
+        assert "Use --force to proceed" in capsys.readouterr().err
+
+    def test_limit_with_dedup_still_needs_force(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Deduplication consumes candidates the limit never sees."""
+        ret = main(["-p", "a******", "-p", "b******", "--charset", "lower",
+                    "--limit", "1"])
+        assert ret == 1
+        assert "Use --force to proceed" in capsys.readouterr().err
+
+    def test_bare_limit_still_skips_the_guard(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """With nothing discarding candidates, the limit does bound the work."""
+        ret = main(["-p", "*******", "--charset", "lower", "--limit", "3"])
+        assert ret == 0
+        assert capsys.readouterr().out.split() == ["aaaaaaa", "aaaaaab", "aaaaaac"]
+
+    def test_bloom_is_sized_for_a_limited_run(self) -> None:
+        """A 3-word sample must not allocate a filter for the whole space."""
+        argv = ["-p", "a*******", "-p", "b*******", "--charset", "lower",
+                "--limit", "3", "--dedup-approx"]
+        cfg = _resolve_options(build_parser().parse_args(argv))
+        assert cfg.total_estimate > 10**9
+        assert cfg.dedup_capacity == 3
+        bloom = _BloomFilter(cfg.dedup_capacity, cfg.dedup_error, _BLOOM_MAX_BYTES)
+        assert bloom.size_bytes < 1024, "filter sized for the space, not the sample"
+
+    def test_bloom_capacity_ignores_limit_when_filtering(self) -> None:
+        """Filters sit after dedup, so it can still see every word."""
+        argv = ["-p", "a***", "-p", "b***", "--charset", "lower",
+                "--limit", "3", "--filter", "^zzz", "--dedup-approx"]
+        cfg = _resolve_options(build_parser().parse_args(argv))
+        assert cfg.dedup_capacity == cfg.total_estimate
+
+    def test_existing_sidecar_is_not_destroyed(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """A fixed sidecar name would truncate an unrelated leftover file."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        bystander = outfile + ".part"
+        with open(bystander, "w") as handle:
+            handle.write("irreplaceable")
+
+        assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
+
+        with open(bystander) as handle:
+            assert handle.read() == "irreplaceable", "clobbered a pre-existing file"
+
+    def test_concurrent_runs_do_not_share_a_sidecar(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """Two runs targeting one output must not collide on the temp path."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        seen: list[str] = []
+        real_mkstemp = tempfile.mkstemp
+
+        def recording_mkstemp(*args: object, **kwargs: object):
+            handle, path = real_mkstemp(*args, **kwargs)  # type: ignore[arg-type]
+            seen.append(path)
+            return handle, path
+
+        with mock.patch("bitbrew.tempfile.mkstemp", side_effect=recording_mkstemp):
+            assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
+            assert main(["-p", "b*", "--charset", "xy", "-o", outfile,
+                         "--overwrite"]) == 0
+        assert len(seen) == 2
+        assert seen[0] != seen[1], "both runs used the same sidecar path"
+
+    def test_output_is_world_readable(self, tmp_path: "os.PathLike[str]") -> None:
+        """mkstemp creates 0600; the finished file must not inherit that."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
+        mode = stat.S_IMODE(os.stat(outfile).st_mode)
+        expected = 0o666 & ~bitbrew._current_umask()
+        assert mode == expected, f"got {mode:o}, expected {expected:o}"
