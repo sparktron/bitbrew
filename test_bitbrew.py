@@ -1335,3 +1335,92 @@ class TestReviewFindings:
         mode = stat.S_IMODE(os.stat(outfile).st_mode)
         expected = 0o666 & ~bitbrew._current_umask()
         assert mode == expected, f"got {mode:o}, expected {expected:o}"
+
+
+class TestOverwriteRace:
+    """The overwrite guard must hold even against the TOCTOU window.
+
+    The resolve-time check can pass and then a file can appear before the
+    output is placed. Placement itself must refuse to clobber it.
+    """
+
+    def test_file_appearing_after_guard_is_not_clobbered(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        real_resolve = bitbrew._resolve_options
+
+        def resolve_then_plant(args: object) -> object:
+            cfg = real_resolve(args)  # guard runs, sees nothing
+            with open(outfile, "w") as handle:  # file appears in the window
+                handle.write("concurrent data")
+            return cfg
+
+        with mock.patch("bitbrew._resolve_options", side_effect=resolve_then_plant):
+            ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
+
+        assert ret == 1
+        assert "already exists" in capsys.readouterr().err
+        with open(outfile) as handle:
+            assert handle.read() == "concurrent data", "clobbered a file mid-run"
+        assert not _sidecars(tmp_path), "left a sidecar behind"
+
+    def test_overwrite_wins_the_race(self, tmp_path: "os.PathLike[str]") -> None:
+        """With --overwrite, a file appearing in the window is still replaced."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        real_resolve = bitbrew._resolve_options
+
+        def resolve_then_plant(args: object) -> object:
+            cfg = real_resolve(args)
+            with open(outfile, "w") as handle:
+                handle.write("stale")
+            return cfg
+
+        with mock.patch("bitbrew._resolve_options", side_effect=resolve_then_plant):
+            ret = main(["-p", "a*", "--charset", "xy", "-o", outfile, "--overwrite"])
+
+        assert ret == 0
+        with open(outfile) as handle:
+            assert sorted(handle.read().split()) == ["ax", "ay"]
+        assert not _sidecars(tmp_path)
+
+    def test_place_output_create_only_refuses_existing(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """The placement primitive rejects an occupied path without overwrite."""
+        src = os.path.join(str(tmp_path), "src.part")
+        dst = os.path.join(str(tmp_path), "dst.txt")
+        with open(src, "w") as handle:
+            handle.write("new")
+        with open(dst, "w") as handle:
+            handle.write("existing")
+
+        with pytest.raises(FileExistsError):
+            bitbrew._place_output(src, dst, overwrite=False)
+        with open(dst) as handle:
+            assert handle.read() == "existing"
+
+    def test_place_output_moves_when_absent(self, tmp_path: "os.PathLike[str]") -> None:
+        """The create-only path still delivers the file and cleans up the sidecar."""
+        src = os.path.join(str(tmp_path), "src.part")
+        dst = os.path.join(str(tmp_path), "dst.txt")
+        with open(src, "w") as handle:
+            handle.write("payload")
+
+        bitbrew._place_output(src, dst, overwrite=False)
+        with open(dst) as handle:
+            assert handle.read() == "payload"
+        assert not os.path.exists(src), "sidecar not removed after create-only place"
+
+    def test_place_output_overwrite_replaces(self, tmp_path: "os.PathLike[str]") -> None:
+        src = os.path.join(str(tmp_path), "src.part")
+        dst = os.path.join(str(tmp_path), "dst.txt")
+        with open(src, "w") as handle:
+            handle.write("new")
+        with open(dst, "w") as handle:
+            handle.write("old")
+
+        bitbrew._place_output(src, dst, overwrite=True)
+        with open(dst) as handle:
+            assert handle.read() == "new"
+        assert not os.path.exists(src)
