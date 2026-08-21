@@ -7,8 +7,10 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import types
 from unittest import mock
@@ -38,6 +40,11 @@ from bitbrew import (
 )
 
 BITBREW_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bitbrew.py")
+
+
+def _sidecars(directory: "os.PathLike[str] | str") -> list[str]:
+    """Leftover .part sidecar files in a directory."""
+    return [name for name in os.listdir(str(directory)) if name.endswith(".part")]
 
 
 class TestResolveCharset:
@@ -342,22 +349,26 @@ class TestGzipCorruptionAndPermissionErrors:
     ) -> None:
         """Writing to an unwritable path should return 1 with an error message."""
         outfile = str(tmp_path / "words.txt")
-        with mock.patch("builtins.open", side_effect=PermissionError("Permission denied")):
+        # Creating the sidecar is the first thing that touches the filesystem.
+        with mock.patch(
+            "bitbrew.tempfile.mkstemp", side_effect=PermissionError("Permission denied")
+        ):
             ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
         assert ret == 1
-        stderr = capsys.readouterr().err
-        assert "could not write" in stderr
+        assert "could not write" in capsys.readouterr().err
+        assert not os.path.exists(outfile)
 
     def test_gz_write_error(
         self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
     ) -> None:
-        """Gzip open failure should return 1 with an error message."""
+        """Gzip stream failure should return 1 with an error message."""
         outfile = str(tmp_path / "words.gz")
-        with mock.patch("gzip.open", side_effect=OSError("disk full")):
+        with mock.patch("bitbrew.gzip.GzipFile", side_effect=OSError("disk full")):
             ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
         assert ret == 1
-        stderr = capsys.readouterr().err
-        assert "could not write" in stderr
+        assert "could not write" in capsys.readouterr().err
+        assert not os.path.exists(outfile)
+        assert not _sidecars(tmp_path)
 
 
 class TestInterruptCleanup:
@@ -426,7 +437,7 @@ class TestInterruptCleanup:
         assert proc.returncode == 130
         assert "Interrupted" in stderr
         assert not os.path.exists(outfile)
-        assert not os.path.exists(outfile + ".part")
+        assert not _sidecars(tmp_path)
 
     def test_interrupt_returns_130(
         self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
@@ -443,7 +454,7 @@ class TestInterruptCleanup:
         assert ret == 130
         assert "Interrupted" in capsys.readouterr().err
         assert not os.path.exists(outfile)
-        assert not os.path.exists(outfile + ".part")
+        assert not _sidecars(tmp_path)
 
     def test_interrupt_restores_old_handler(self, tmp_path: "os.PathLike[str]") -> None:
         """After interrupt handling, the original SIGINT handler is restored."""
@@ -494,7 +505,7 @@ class TestAtomicOutput:
         assert ret == 1
         assert "could not write" in capsys.readouterr().err
         assert not os.path.exists(outfile), "truncated wordlist left at output path"
-        assert not os.path.exists(outfile + ".part")
+        assert not _sidecars(tmp_path)
 
     def test_success_leaves_no_part_file(self, tmp_path: "os.PathLike[str]") -> None:
         """A successful run renames the sidecar away."""
@@ -502,7 +513,7 @@ class TestAtomicOutput:
         ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
         assert ret == 0
         assert os.path.exists(outfile)
-        assert not os.path.exists(outfile + ".part")
+        assert not _sidecars(tmp_path)
 
 
 class TestDedupPolicy:
@@ -718,11 +729,11 @@ class TestAuditFixes:
     ) -> None:
         """OSError during file write should return 1 with a message, not crash."""
         outfile = str(tmp_path / "words.txt")
-        with mock.patch("builtins.open", side_effect=OSError("disk full")):
+        with mock.patch("bitbrew.tempfile.mkstemp", side_effect=OSError("disk full")):
             ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
         assert ret == 1
-        stderr = capsys.readouterr().err
-        assert "could not write" in stderr
+        assert "could not write" in capsys.readouterr().err
+        assert not os.path.exists(outfile)
 
     def test_estimate_count_capped(self) -> None:
         """estimate_count should cap at _MAX_ESTIMATE for huge patterns."""
@@ -1231,3 +1242,96 @@ class TestVersionFlag:
         """pyproject reads the version from the module, so they cannot drift."""
         installed = importlib.metadata.version("bitbrew")
         assert installed == bitbrew.__version__
+
+
+class TestReviewFindings:
+    """Regressions for defects found in review of this branch."""
+
+    def test_limit_with_filter_still_needs_force(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--limit bounds emitted words, not words examined.
+
+        A filter that matches nothing walks the whole space regardless of the
+        limit, so the guard has to keep asking about the full estimate.
+        """
+        ret = main(["-p", "*******", "--charset", "lower",
+                    "--filter", "^Z$", "--limit", "1"])
+        assert ret == 1
+        assert "Use --force to proceed" in capsys.readouterr().err
+
+    def test_limit_with_dedup_still_needs_force(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Deduplication consumes candidates the limit never sees."""
+        ret = main(["-p", "a******", "-p", "b******", "--charset", "lower",
+                    "--limit", "1"])
+        assert ret == 1
+        assert "Use --force to proceed" in capsys.readouterr().err
+
+    def test_bare_limit_still_skips_the_guard(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """With nothing discarding candidates, the limit does bound the work."""
+        ret = main(["-p", "*******", "--charset", "lower", "--limit", "3"])
+        assert ret == 0
+        assert capsys.readouterr().out.split() == ["aaaaaaa", "aaaaaab", "aaaaaac"]
+
+    def test_bloom_is_sized_for_a_limited_run(self) -> None:
+        """A 3-word sample must not allocate a filter for the whole space."""
+        argv = ["-p", "a*******", "-p", "b*******", "--charset", "lower",
+                "--limit", "3", "--dedup-approx"]
+        cfg = _resolve_options(build_parser().parse_args(argv))
+        assert cfg.total_estimate > 10**9
+        assert cfg.dedup_capacity == 3
+        bloom = _BloomFilter(cfg.dedup_capacity, cfg.dedup_error, _BLOOM_MAX_BYTES)
+        assert bloom.size_bytes < 1024, "filter sized for the space, not the sample"
+
+    def test_bloom_capacity_ignores_limit_when_filtering(self) -> None:
+        """Filters sit after dedup, so it can still see every word."""
+        argv = ["-p", "a***", "-p", "b***", "--charset", "lower",
+                "--limit", "3", "--filter", "^zzz", "--dedup-approx"]
+        cfg = _resolve_options(build_parser().parse_args(argv))
+        assert cfg.dedup_capacity == cfg.total_estimate
+
+    def test_existing_sidecar_is_not_destroyed(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """A fixed sidecar name would truncate an unrelated leftover file."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        bystander = outfile + ".part"
+        with open(bystander, "w") as handle:
+            handle.write("irreplaceable")
+
+        assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
+
+        with open(bystander) as handle:
+            assert handle.read() == "irreplaceable", "clobbered a pre-existing file"
+
+    def test_concurrent_runs_do_not_share_a_sidecar(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """Two runs targeting one output must not collide on the temp path."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        seen: list[str] = []
+        real_mkstemp = tempfile.mkstemp
+
+        def recording_mkstemp(*args: object, **kwargs: object):
+            handle, path = real_mkstemp(*args, **kwargs)  # type: ignore[arg-type]
+            seen.append(path)
+            return handle, path
+
+        with mock.patch("bitbrew.tempfile.mkstemp", side_effect=recording_mkstemp):
+            assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
+            assert main(["-p", "b*", "--charset", "xy", "-o", outfile,
+                         "--overwrite"]) == 0
+        assert len(seen) == 2
+        assert seen[0] != seen[1], "both runs used the same sidecar path"
+
+    def test_output_is_world_readable(self, tmp_path: "os.PathLike[str]") -> None:
+        """mkstemp creates 0600; the finished file must not inherit that."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
+        mode = stat.S_IMODE(os.stat(outfile).st_mode)
+        expected = 0o666 & ~bitbrew._current_umask()
+        assert mode == expected, f"got {mode:o}, expected {expected:o}"

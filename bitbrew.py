@@ -27,6 +27,7 @@ import os
 import re
 import signal
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Generator, Iterable, Iterator
 from typing import Optional, Protocol
@@ -509,6 +510,17 @@ def _human_bytes(size: float) -> str:
     raise AssertionError("unreachable")
 
 
+def _current_umask() -> int:
+    """Read the process umask without leaving it changed.
+
+    Returns:
+        The umask currently in effect.
+    """
+    value = os.umask(0)
+    os.umask(value)
+    return value
+
+
 def _remove_if_exists(path: str) -> None:
     """Delete a file, ignoring the case where it was never created.
 
@@ -647,16 +659,52 @@ class _RunConfig:
     count_only: bool
 
     @property
-    def effective_scale(self) -> int:
-        """Upper bound on how many words this run will actually emit.
+    def discards_candidates(self) -> bool:
+        """Whether a stage between generation and output can drop candidates.
 
-        --limit caps the output regardless of how large the pattern space is,
-        so this is what the --force guard should be asking about.
+        When one can, --limit bounds only the words emitted, not the words
+        examined: a filter that matches nothing still walks the whole space.
 
         Returns:
-            The bounded output size.
+            True if filtering or deduplication sits in the pipeline.
+        """
+        return (
+            self.min_len is not None
+            or self.max_len is not None
+            or self.regex is not None
+            or self.dedup != "none"
+        )
+
+    @property
+    def effective_scale(self) -> int:
+        """Upper bound on the work the --force guard is being asked to approve.
+
+        --limit caps the output, but it only caps the *work* when nothing can
+        discard a candidate on the way out. With a filter or deduplication in
+        play the run can still enumerate the entire space looking for matches,
+        so the guard has to keep asking about the full estimate.
+
+        Returns:
+            The bounded scale of the run.
+        """
+        if self.limit is None or self.discards_candidates:
+            return self.total_estimate
+        return min(self.total_estimate, self.limit)
+
+    @property
+    def dedup_capacity(self) -> int:
+        """How many distinct words approximate deduplication must hold.
+
+        Deduplication runs before filtering and before --limit, so it only gets
+        to be limit-sized when nothing downstream can discard a candidate --
+        otherwise it can still see every word in the space.
+
+        Returns:
+            The capacity to size a Bloom filter for.
         """
         if self.limit is None:
+            return self.total_estimate
+        if self.min_len is not None or self.max_len is not None or self.regex is not None:
             return self.total_estimate
         return min(self.total_estimate, self.limit)
 
@@ -918,7 +966,7 @@ def _dedup_stage(words: Iterable[str], cfg: _RunConfig) -> Iterable[str]:
     if cfg.dedup == "none":
         return words
     if cfg.dedup == "approx":
-        bloom = _BloomFilter(cfg.total_estimate, cfg.dedup_error, _BLOOM_MAX_BYTES)
+        bloom = _BloomFilter(cfg.dedup_capacity, cfg.dedup_error, _BLOOM_MAX_BYTES)
         print(
             f"Note: approximate deduplication in {_human_bytes(bloom.size_bytes)}, "
             f"expected false-positive rate {bloom.expected_error_rate:.2g}. "
@@ -1001,18 +1049,28 @@ def _write_to_file(words: Iterable[str], cfg: _RunConfig) -> int:
     old_handler = signal.signal(signal.SIGINT, handle_interrupt)
 
     # Build into a sidecar file and rename on success, so an interrupted or
-    # failed run never leaves a truncated wordlist at output_path.
-    temp_path = output_path + ".part"
+    # failed run never leaves a truncated wordlist at output_path. The sidecar
+    # is created exclusively under a unique name: a fixed one would truncate an
+    # unrelated leftover file, and two concurrent runs would corrupt each other.
+    temp_path: str | None = None
     progress: _ProgressBar | None = None
     try:
         progress = _make_progress(cfg)
+        handle, temp_path = tempfile.mkstemp(
+            dir=os.path.dirname(output_path) or ".",
+            prefix=os.path.basename(output_path) + ".",
+            suffix=".part",
+        )
         if cfg.use_compress:
-            with gzip.open(temp_path, "wb") as binary:
+            with (
+                os.fdopen(handle, "wb") as raw,
+                gzip.GzipFile(fileobj=raw, mode="wb") as binary,
+            ):
                 written = _chunked_write(
                     words, binary, cfg.chunk_size, progress, lambda: interrupted
                 )
         else:
-            with open(temp_path, "w", encoding="utf-8") as text:
+            with os.fdopen(handle, "w", encoding="utf-8") as text:
                 written = _chunked_write(
                     words, text, cfg.chunk_size, progress, lambda: interrupted
                 )
@@ -1024,14 +1082,19 @@ def _write_to_file(words: Iterable[str], cfg: _RunConfig) -> int:
         if interrupted:
             raise KeyboardInterrupt
 
+        # mkstemp creates 0600; give the finished file the mode a plain open()
+        # would have produced.
+        os.chmod(temp_path, 0o666 & ~_current_umask())
         os.replace(temp_path, output_path)
         print(f"Wrote {written:,} words to {output_path}", file=sys.stderr)
     except KeyboardInterrupt:
-        _remove_if_exists(temp_path)
+        if temp_path is not None:
+            _remove_if_exists(temp_path)
         print("\nInterrupted. Partial output file removed.", file=sys.stderr)
         return 130
     except OSError as exc:
-        _remove_if_exists(temp_path)
+        if temp_path is not None:
+            _remove_if_exists(temp_path)
         print(f"Error: could not write to '{output_path}': {exc}", file=sys.stderr)
         return 1
     finally:

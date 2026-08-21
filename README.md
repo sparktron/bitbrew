@@ -220,7 +220,8 @@ bitbrew -p "admin*" -p "root*" --charset all --force --dedup-approx -o wordlist.
 > ⚠️ Approximate deduplication can drop a small, quantified fraction of **valid** words —
 > that is the trade for constant memory. The default rate is one in a million; tune it with
 > `--dedup-error`. bitbrew prints the filter's size and its expected error rate before
-> starting. It never keeps a duplicate, and never drops a word it has not seen; the only
+> starting, and sizes it for the sample rather than the whole space when `--limit` bounds
+> what it can see. It never keeps a duplicate, and never drops a word it has not seen; the only
 > error is dropping a word it wrongly believes it has seen.
 
 ---
@@ -260,9 +261,15 @@ generating it:
 bitbrew -p "*******" --charset lower --limit 5
 ```
 
-Because `--limit` bounds the output, it also bounds the `--force` check — sampling never
-needs confirmation. Note that a `--limit` combined with a restrictive `--filter` can still
-scan a lot of the space looking for matches.
+When nothing can discard a candidate, `--limit` bounds the work as well as the output, so
+sampling needs no `--force`. Add a `--filter`, `--min-len`/`--max-len`, or deduplication
+and that stops being true — a filter matching nothing walks the entire space regardless of
+the limit — so the guard goes back to asking about the full estimate:
+
+```bash
+# Refused: this could examine all 8 billion candidates to emit one word
+bitbrew -p "*******" --charset lower --filter "^Z$" --limit 1
+```
 
 ---
 
