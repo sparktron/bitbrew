@@ -1,5 +1,6 @@
 """Tests for bitbrew.py."""
 
+import errno
 import gzip
 import importlib.metadata
 import io
@@ -45,6 +46,16 @@ BITBREW_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bitbrew.p
 def _sidecars(directory: "os.PathLike[str] | str") -> list[str]:
     """Leftover .part sidecar files in a directory."""
     return [name for name in os.listdir(str(directory)) if name.endswith(".part")]
+
+
+class _BinaryStdout:
+    """A non-tty stdout stand-in exposing .buffer, for --compress tests."""
+
+    def __init__(self, binary: "io.BufferedWriter") -> None:
+        self.buffer = binary
+
+    def isatty(self) -> bool:
+        return False
 
 
 class TestResolveCharset:
@@ -469,21 +480,124 @@ class TestInterruptCleanup:
 
         assert signal.getsignal(signal.SIGINT) is old_handler
 
-    def test_stdout_keyboard_interrupt(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """KeyboardInterrupt on stdout path should return 0 gracefully."""
-        call_count = 0
-        original_print = print
 
-        def interrupting_print(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count > 1:
-                raise KeyboardInterrupt
-            original_print(*args, **kwargs)
+class TestStdoutFailureModes:
+    """stdout must report failure as clearly as the -o path does.
 
-        with mock.patch("builtins.print", side_effect=interrupting_print):
+    These previously all returned 0: an interrupted run looked successful, and
+    a failed write escaped as a raw traceback.
+    """
+
+    @staticmethod
+    def _pipeline_raising(exc: BaseException):
+        """Build a _build_pipeline stand-in that fails after one word."""
+
+        def fake(cfg, should_stop=None):
+            yield "aa"
+            raise exc
+
+        return fake
+
+    def test_interrupt_returns_130(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """An interrupt mid-stream reports 130, matching the -o path."""
+        with mock.patch(
+            "bitbrew._build_pipeline",
+            side_effect=self._pipeline_raising(KeyboardInterrupt()),
+        ):
             ret = main(["-p", "a*", "--charset", "xy"])
-        assert ret == 0
+
+        assert ret == 130
+        assert "Interrupted" in capsys.readouterr().err
+
+    def test_write_error_returns_1_without_traceback(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A full disk under a redirect is a clean error, not a stack trace."""
+        with mock.patch(
+            "bitbrew._build_pipeline",
+            side_effect=self._pipeline_raising(
+                OSError(errno.ENOSPC, "No space left on device")
+            ),
+        ):
+            ret = main(["-p", "a*", "--charset", "xy"])
+
+        assert ret == 1
+        err = capsys.readouterr().err
+        assert "could not write to stdout" in err
+        assert "Traceback" not in err
+
+    def test_compressed_write_error_returns_1(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """The gzip path reports write failures the same way the plain one does."""
+        with (
+            mock.patch(
+                "bitbrew._build_pipeline",
+                side_effect=self._pipeline_raising(
+                    OSError(errno.ENOSPC, "No space left on device")
+                ),
+            ),
+            open(os.path.join(str(tmp_path), "sink.gz"), "wb") as sink,
+            mock.patch.object(sys, "stdout", _BinaryStdout(sink)),
+        ):
+            ret = main(["-p", "a*", "--charset", "xy", "--compress"])
+
+        assert ret == 1
+        assert "could not write to stdout" in capsys.readouterr().err
+
+    def test_real_sigint_on_compressed_stdout(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """An interrupted gzip stream must not report success.
+
+        Returning 0 here let `bitbrew ... > out.gz && use out.gz` proceed on an
+        archive that had stopped mid-member.
+        """
+        target = os.path.join(str(tmp_path), "part.gz")
+        with open(target, "wb") as sink:
+            proc = subprocess.Popen(
+                [sys.executable, BITBREW_PY, "-p", "******", "--charset", "lower",
+                 "--force", "--compress"],
+                stdout=sink, stderr=subprocess.PIPE, text=True,
+            )
+            time.sleep(1.5)
+            assert proc.poll() is None, "a 3e8-word run should not finish this fast"
+            proc.send_signal(signal.SIGINT)
+            try:
+                _, stderr = proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                pytest.fail("SIGINT did not stop the compressed stdout run")
+
+        assert proc.returncode == 130
+        assert "Interrupted" in stderr
+
+    def test_broken_pipe_is_success_and_silent(self) -> None:
+        """`| head` closing early is what the user asked for, not a failure."""
+        reader = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.readline()"],
+            stdin=subprocess.PIPE,
+        )
+        writer = subprocess.Popen(
+            [sys.executable, BITBREW_PY, "-p", "*****", "--charset", "lower",
+             "--force"],
+            stdout=reader.stdin, stderr=subprocess.PIPE, text=True,
+        )
+        assert reader.stdin is not None
+        reader.stdin.close()
+        reader.wait(timeout=30)
+        try:
+            _, stderr = writer.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            writer.kill()
+            writer.communicate()
+            pytest.fail("a closed downstream pipe did not stop the writer")
+
+        assert writer.returncode == 0
+        # The shutdown flush must not re-raise on the closed pipe.
+        assert "Exception ignored" not in stderr
+        assert "BrokenPipeError" not in stderr
 
 
 class TestAtomicOutput:

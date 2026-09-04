@@ -1166,8 +1166,24 @@ def _write_to_file(
     return 0
 
 
+def _detach_stdout() -> None:
+    """Point stdout at the null device after the reader has gone away.
+
+    Python flushes stdout again during interpreter shutdown; on a closed pipe
+    that raises a second BrokenPipeError and prints "Exception ignored" noise
+    after an otherwise ordinary `| head`.
+    """
+    with contextlib.suppress(OSError, ValueError):
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+
+
 def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
     """Stream words to stdout, gzipped when asked.
+
+    Exit codes match the -o path: 130 when interrupted, 1 when the write
+    fails. A closed downstream pipe is the one success case -- `| head`
+    getting what it asked for is not an error.
 
     Args:
         words: The finished word stream.
@@ -1177,11 +1193,19 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
         Process exit code.
     """
     if not cfg.use_compress:
+        # BrokenPipeError subclasses OSError, so it has to be caught first.
         try:
             for word in words:
                 print(word)
-        except (BrokenPipeError, KeyboardInterrupt):
+        except BrokenPipeError:
+            _detach_stdout()
             return 0
+        except KeyboardInterrupt:
+            print("\nInterrupted.", file=sys.stderr)
+            return 130
+        except OSError as exc:
+            print(f"Error: could not write to stdout: {exc}", file=sys.stderr)
+            return 1
         return 0
 
     # Gzip to stdout, but never at a terminal -- binary down a TTY is noise.
@@ -1202,8 +1226,21 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
     try:
         with gzip.GzipFile(fileobj=raw, mode="wb") as binary:
             _chunked_write(words, binary, cfg.chunk_size)
-    except (BrokenPipeError, KeyboardInterrupt):
+    except BrokenPipeError:
+        _detach_stdout()
         return 0
+    except KeyboardInterrupt:
+        # The stream stops mid-member, so it will not decompress. Reporting
+        # success here would let `bitbrew ... > out.gz && use out.gz` run on
+        # a truncated archive.
+        print(
+            "\nInterrupted. Compressed output is incomplete.",
+            file=sys.stderr,
+        )
+        return 130
+    except OSError as exc:
+        print(f"Error: could not write to stdout: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
