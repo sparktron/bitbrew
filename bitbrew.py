@@ -419,6 +419,63 @@ def _text_writer(
 _STOP_CHECK_INTERVAL = 10_000  # words between should_stop() polls
 
 
+@contextlib.contextmanager
+def _interrupt_guard() -> Iterator[Callable[[], bool]]:
+    """Install a flag-setting SIGINT handler for the duration of the block.
+
+    Yields a predicate reporting whether an interrupt has arrived. Replacing the
+    default handler disarms KeyboardInterrupt, so *every* unbounded loop in the
+    run has to poll this predicate. Miss one and Ctrl-C is not merely late, it
+    is ignored outright.
+
+    Signal handlers can only be installed on the main thread. Off it, the block
+    runs under default KeyboardInterrupt behaviour and the predicate stays
+    False, so library callers get a working run rather than a ValueError.
+    """
+    interrupted = False
+
+    def handle(sig: int, frame: object) -> None:
+        nonlocal interrupted
+        interrupted = True
+
+    try:
+        old_handler = signal.signal(signal.SIGINT, handle)
+    except ValueError:
+        yield lambda: False
+        return
+    try:
+        yield lambda: interrupted
+    finally:
+        signal.signal(signal.SIGINT, old_handler)
+
+
+def _interruptible(
+    words: Iterable[str], should_stop: Callable[[], bool]
+) -> Generator[str, None, None]:
+    """Raise KeyboardInterrupt at the source once an interrupt has arrived.
+
+    This belongs on the generator rather than on the writer. Later stages can
+    discard every candidate they see -- a filter matching nothing is the
+    documented worst case -- and a poll that only runs per *written* word would
+    then never run at all, leaving the process deaf to Ctrl-C for the entire
+    walk of the pattern space.
+
+    Args:
+        words: The raw candidate stream.
+        should_stop: Predicate polled every _STOP_CHECK_INTERVAL candidates.
+
+    Yields:
+        Each candidate, unchanged.
+
+    Raises:
+        KeyboardInterrupt: When should_stop() returns True.
+    """
+    for seen, word in enumerate(words, 1):
+        if seen % _STOP_CHECK_INTERVAL == 0 and should_stop():
+            raise KeyboardInterrupt
+        yield word
+
+
 def _chunked_write(
     words: Iterable[str],
     file_obj: "gzip.GzipFile | io.TextIOBase | io.StringIO",
@@ -953,7 +1010,7 @@ def _resolve_options(args: argparse.Namespace) -> _RunConfig:
     )
 
 
-def _dedup_stage(words: Iterable[str], cfg: _RunConfig) -> Iterable[str]:
+def _dedup_stage(words: Iterator[str], cfg: _RunConfig) -> Iterator[str]:
     """Apply the configured deduplication strategy, reporting its cost.
 
     Args:
@@ -984,11 +1041,14 @@ def _dedup_stage(words: Iterable[str], cfg: _RunConfig) -> Iterable[str]:
     return _deduplicated(words)
 
 
-def _build_pipeline(cfg: _RunConfig) -> Iterator[str]:
-    """Compose the full generate-dedup-filter-limit stream.
+def _build_pipeline(
+    cfg: _RunConfig, should_stop: Callable[[], bool] | None = None
+) -> Iterator[str]:
+    """Compose the full generate-filter-dedup-limit stream.
 
     Args:
         cfg: Resolved run configuration.
+        should_stop: Optional interrupt predicate, polled at the source.
 
     Returns:
         The finished word stream.
@@ -998,8 +1058,16 @@ def _build_pipeline(cfg: _RunConfig) -> Iterator[str]:
         for pattern in cfg.patterns:
             yield from _expand_pattern(pattern, cfg.charset)
 
-    words = _apply_filters(
-        _dedup_stage(expand(), cfg), cfg.min_len, cfg.max_len, cfg.regex
+    source: Iterable[str] = expand()
+    if should_stop is not None:
+        source = _interruptible(source, should_stop)
+
+    # Filter before dedup. Both stages are per-word and order-preserving, so
+    # the output is identical either way, but this keeps rejected candidates
+    # out of the dedup set entirely -- its memory then tracks the output rather
+    # than the whole pattern space, which is the tool's real scaling limit.
+    words = _dedup_stage(
+        _apply_filters(source, cfg.min_len, cfg.max_len, cfg.regex), cfg
     )
     if cfg.limit is not None:
         return itertools.islice(words, cfg.limit)
@@ -1026,12 +1094,15 @@ def _make_progress(cfg: _RunConfig) -> _ProgressBar | None:
     return bar
 
 
-def _write_to_file(words: Iterable[str], cfg: _RunConfig) -> int:
+def _write_to_file(
+    words: Iterable[str], cfg: _RunConfig, should_stop: Callable[[], bool]
+) -> int:
     """Generate into cfg.output_path atomically and interruptibly.
 
     Args:
         words: The finished word stream.
         cfg: Resolved run configuration.
+        should_stop: Interrupt predicate owned by the caller's _interrupt_guard.
 
     Returns:
         Process exit code.
@@ -1039,14 +1110,6 @@ def _write_to_file(words: Iterable[str], cfg: _RunConfig) -> int:
     if cfg.output_path is None:
         raise ValueError("_write_to_file requires an output path")
     output_path = cfg.output_path
-
-    interrupted = False
-
-    def handle_interrupt(sig: int, frame: object) -> None:
-        nonlocal interrupted
-        interrupted = True
-
-    old_handler = signal.signal(signal.SIGINT, handle_interrupt)
 
     # Build into a sidecar file and rename on success, so an interrupted or
     # failed run never leaves a truncated wordlist at output_path. The sidecar
@@ -1067,19 +1130,19 @@ def _write_to_file(words: Iterable[str], cfg: _RunConfig) -> int:
                 gzip.GzipFile(fileobj=raw, mode="wb") as binary,
             ):
                 written = _chunked_write(
-                    words, binary, cfg.chunk_size, progress, lambda: interrupted
+                    words, binary, cfg.chunk_size, progress, should_stop
                 )
         else:
             with os.fdopen(handle, "w", encoding="utf-8") as text:
                 written = _chunked_write(
-                    words, text, cfg.chunk_size, progress, lambda: interrupted
+                    words, text, cfg.chunk_size, progress, should_stop
                 )
 
         if progress is not None:
             progress.close()
 
         # A signal can still land between the last poll and here.
-        if interrupted:
+        if should_stop():
             raise KeyboardInterrupt
 
         # mkstemp creates 0600; give the finished file the mode a plain open()
@@ -1100,7 +1163,6 @@ def _write_to_file(words: Iterable[str], cfg: _RunConfig) -> int:
     finally:
         if progress is not None:
             progress.close()
-        signal.signal(signal.SIGINT, old_handler)
     return 0
 
 
@@ -1177,14 +1239,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    words = _build_pipeline(cfg)
+    # The guard spans generation as well as writing: with a restrictive filter
+    # the pipeline can run for hours without emitting a word, and that stretch
+    # has to stay interruptible too.
+    with _interrupt_guard() as should_stop:
+        words = _build_pipeline(cfg, should_stop)
 
-    if cfg.count_only:
-        print(sum(1 for _ in words))
-        return 0
-    if cfg.output_path:
-        return _write_to_file(words, cfg)
-    return _write_to_stdout(words, cfg)
+        if cfg.count_only:
+            try:
+                print(sum(1 for _ in words))
+            except KeyboardInterrupt:
+                print("\nInterrupted.", file=sys.stderr)
+                return 130
+            return 0
+        if cfg.output_path:
+            return _write_to_file(words, cfg, should_stop)
+        return _write_to_stdout(words, cfg)
 
 
 if __name__ == "__main__":
