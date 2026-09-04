@@ -30,6 +30,7 @@ from bitbrew import (
     _expand_pattern,
     _needs_dedup,
     _parse_pattern,
+    _plan_bloom,
     _probe_regex_blowup,
     _resolve_options,
     build_parser,
@@ -1271,6 +1272,89 @@ class TestBloomFilter:
         # The reported rate degrades honestly rather than staying at the target.
         assert bloom.expected_error_rate > 1e-9
 
+    def test_capped_filter_really_does_drop_valid_words(self) -> None:
+        """Pin down what a pinned error rate costs, so the refusal has a reason.
+
+        This test previously asserted only that the rate rose above the target,
+        which a rate of exactly 1.0 satisfies -- it accepted total data loss as
+        correct behaviour.
+        """
+        bloom = _BloomFilter(10**6, 1e-6, max_bytes=1024)
+        assert bloom.expected_error_rate == pytest.approx(1.0)
+        kept = sum(1 for i in range(5000) if bloom.add_if_absent(f"distinct-{i}"))
+        assert kept < 5000 * 0.9, "a rate of 1.0 should be losing most words"
+
+    def test_sizing_does_not_allocate(self) -> None:
+        """_plan_bloom must be answerable without paying for the bit array."""
+        plan = _plan_bloom(10**15, 1e-9, _BLOOM_MAX_BYTES)
+        assert plan.size_bytes == _BLOOM_MAX_BYTES
+        assert plan.error_rate == pytest.approx(1.0)
+
+    def test_run_is_refused_when_the_rate_cannot_be_honoured(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Rather than silently discarding most of the wordlist, stop."""
+        with mock.patch("bitbrew._BLOOM_MAX_BYTES", 64):
+            ret = main(["-p", "??????", "-p", "??????", "--charset", "lower",
+                        "--force", "--dedup-approx", "--count"])
+
+        assert ret == 1
+        err = capsys.readouterr().err
+        assert "approximate deduplication" in err
+        assert "--no-dedup" in err, "the error must name a way forward"
+
+    def test_refusal_omits_dedup_error_advice_when_useless(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--dedup-error only takes values below 1, so never suggest 1."""
+        with mock.patch("bitbrew._BLOOM_MAX_BYTES", 64):
+            main(["-p", "??????", "-p", "??????", "--charset", "lower",
+                  "--force", "--dedup-approx", "--count"])
+
+        err = capsys.readouterr().err
+        assert "--dedup-error 1 " not in err
+        assert "--dedup-error 1\n" not in err
+
+    def test_suggested_dedup_error_is_actually_usable(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Advice the parser would reject is worse than no advice.
+
+        Takes the rate named in the refusal and feeds it straight back, which
+        must clear both the --dedup-error range check and the refusal itself.
+        """
+        argv = ["-p", "????", "-p", "????", "--charset", "lower",
+                "--dedup-approx", "--dedup-error", "1e-9", "--count"]
+        with mock.patch("bitbrew._BLOOM_MAX_BYTES", 1_900_000):
+            assert main(argv) == 1
+            err = capsys.readouterr().err
+            match = re.search(r"--dedup-error (\S+) to accept", err)
+            assert match, f"no usable rate suggested in: {err}"
+
+            retry = argv.copy()
+            retry[retry.index("1e-9")] = match.group(1)
+            assert main(retry) == 0, "the tool suggested a rate it then rejects"
+
+    def test_achievable_rate_is_accepted(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A run whose requested rate does fit must still go through untouched."""
+        ret = main(["-p", "a*", "-p", "a*", "--charset", "lower",
+                    "--dedup-approx", "--count"])
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == "26"
+
+    def test_memory_error_becomes_a_clean_message(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An oversized allocation must not surface as a bare MemoryError."""
+        with mock.patch("bitbrew.bytearray", side_effect=MemoryError, create=True):
+            ret = main(["-p", "a*", "-p", "a*", "--charset", "lower",
+                        "--dedup-approx", "--count"])
+
+        assert ret == 1
+        assert "not enough memory" in capsys.readouterr().err
+
     def test_cli_dedup_approx_removes_duplicates(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -1401,12 +1485,46 @@ class TestReviewFindings:
         bloom = _BloomFilter(cfg.dedup_capacity, cfg.dedup_error, _BLOOM_MAX_BYTES)
         assert bloom.size_bytes < 1024, "filter sized for the space, not the sample"
 
-    def test_bloom_capacity_ignores_limit_when_filtering(self) -> None:
-        """Filters sit after dedup, so it can still see every word."""
+    def test_bloom_capacity_respects_limit_even_when_filtering(self) -> None:
+        """Filters now sit upstream of dedup, so they cannot inflate it.
+
+        This asserted the opposite while filters ran after dedup. Sizing for
+        the whole space under a limit is not merely wasteful now: it can push
+        the filter past its ceiling and get an otherwise fine run refused.
+        """
         argv = ["-p", "a***", "-p", "b***", "--charset", "lower",
                 "--limit", "3", "--filter", "^zzz", "--dedup-approx"]
         cfg = _resolve_options(build_parser().parse_args(argv))
-        assert cfg.dedup_capacity == cfg.total_estimate
+        assert cfg.total_estimate > 3
+        assert cfg.dedup_capacity == 3
+
+    def test_dedup_never_tracks_more_than_the_limit(self) -> None:
+        """The capacity bound above must hold in the built pipeline, not just on paper.
+
+        A filter that rejects almost everything is the case that would break it:
+        dedup must still never be handed more distinct words than --limit.
+        """
+        argv = ["-p", "a***", "-p", "b***", "--charset", "lower",
+                "--limit", "3", "--filter", "^a.a", "--dedup-approx"]
+        cfg = _resolve_options(build_parser().parse_args(argv))
+
+        peak = 0
+        real_add = bitbrew._BloomFilter.add_if_absent
+        held = set()
+
+        def counting_add(self, item: str) -> bool:
+            nonlocal peak
+            fresh = real_add(self, item)
+            if fresh:
+                held.add(item)
+                peak = max(peak, len(held))
+            return fresh
+
+        with mock.patch.object(bitbrew._BloomFilter, "add_if_absent", counting_add):
+            words = list(bitbrew._build_pipeline(cfg))
+
+        assert len(words) == 3
+        assert peak <= 3, f"dedup held {peak} words under --limit 3"
 
     def test_existing_sidecar_is_not_destroyed(
         self, tmp_path: "os.PathLike[str]"
