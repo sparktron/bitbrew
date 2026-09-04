@@ -1567,3 +1567,57 @@ class TestReviewFindings:
         mode = stat.S_IMODE(os.stat(outfile).st_mode)
         expected = 0o666 & ~bitbrew._current_umask()
         assert mode == expected, f"got {mode:o}, expected {expected:o}"
+
+
+class TestReadmeExamples:
+    """The README's examples must do what the README says they do.
+
+    The escape example shipped as `-p 'pw\\*'`, which is correct inside the
+    module docstring -- where \\ renders as a single backslash -- but wrong in
+    Markdown, where it reaches the shell verbatim. It emitted ten words
+    containing a literal backslash instead of the one word documented.
+    """
+
+    README = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md")
+
+    def _readme(self) -> str:
+        with open(self.README, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_documented_escape_example_emits_one_literal_word(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Run the escape example exactly as the README prints it."""
+        text = self._readme()
+        match = re.search(r"^bitbrew -p '(pw[^']*)' --charset digits$", text, re.M)
+        assert match, "the documented escape example has moved or changed shape"
+
+        assert main(["-p", match.group(1), "--charset", "digits"]) == 0
+        assert capsys.readouterr().out.split() == ["pw*"]
+
+    def test_escape_is_documented_as_a_single_backslash(self) -> None:
+        """A doubled backslash in Markdown is a different, working pattern."""
+        text = self._readme()
+        assert "`\\\\`" not in text, "Markdown renders \\\\ literally, not as one backslash"
+
+    def test_sidecar_name_is_documented_accurately(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """mkstemp inserts a random component, so `<output>.part` is not the name."""
+        assert "`<output>.<random>.part`" in self._readme()
+
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        seen: list[str] = []
+        real_mkstemp = tempfile.mkstemp
+
+        def recording_mkstemp(*args: object, **kwargs: object):
+            handle, path = real_mkstemp(*args, **kwargs)  # type: ignore[arg-type]
+            seen.append(os.path.basename(path))
+            return handle, path
+
+        with mock.patch("bitbrew.tempfile.mkstemp", side_effect=recording_mkstemp):
+            assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
+
+        assert len(seen) == 1
+        assert seen[0] != "words.txt.part", "the documented name was the real one"
+        assert re.fullmatch(r"words\.txt\.\w+\.part", seen[0]), seen[0]

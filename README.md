@@ -12,7 +12,7 @@
 
 ## ✨ Features
 
-- 🔣 **Wildcard patterns** — `*` for exactly one char, `?` for zero-or-one char, `\\` to escape either
+- 🔣 **Wildcard patterns** — `*` for exactly one char, `?` for zero-or-one char, `\` to escape either
 - 🔡 **Flexible charsets** — built-in presets, comma-combined, or raw custom strings
 - 📁 **Streaming output** — write to stdout, a file, or gzip-compressed output
 - 🔍 **Filtering** — by minimum/maximum length and/or regex (screened for catastrophic backtracking)
@@ -80,7 +80,7 @@ bitbrew -p "**" --charset "abc123"
 |----------|---------|
 | `*` | **Exactly one** character from the active charset |
 | `?` | **Zero or one** character — generates two variants per position |
-| `\\` | Escapes the next character, making it literal |
+| `\` | Escapes the next character, making it literal |
 
 Literal characters are preserved as-is. Multiple wildcards produce the full Cartesian product.
 
@@ -88,8 +88,8 @@ Literal characters are preserved as-is. Multiple wildcards produce the full Cart
 # ? generates optional positions: "ab" and "axb"
 bitbrew -p "a?b" --charset "x"
 
-# \\ makes a wildcard literal: emits the single word "pw*"
-bitbrew -p 'pw\\*' --charset digits
+# \ makes a wildcard literal: emits the single word "pw*"
+bitbrew -p 'pw\*' --charset digits
 ```
 
 ---
@@ -220,9 +220,16 @@ bitbrew -p "admin*" -p "root*" --charset all --force --dedup-approx -o wordlist.
 > ⚠️ Approximate deduplication can drop a small, quantified fraction of **valid** words —
 > that is the trade for constant memory. The default rate is one in a million; tune it with
 > `--dedup-error`. bitbrew prints the filter's size and its expected error rate before
-> starting, and sizes it for the sample rather than the whole space when `--limit` bounds
+> allocating it, and sizes it for the sample rather than the whole space when `--limit` bounds
 > what it can see. It never keeps a duplicate, and never drops a word it has not seen; the only
 > error is dropping a word it wrongly believes it has seen.
+>
+> The filter is capped at 2 GiB. If your requested rate would need more than that, bitbrew
+> **refuses the run** rather than quietly degrading: past the cap the achievable rate climbs
+> towards 1, at which point the filter treats nearly every word as already-seen and most of
+> your wordlist disappears with nothing to show it happened. The error names the best rate
+> that does fit, so you can accept it with `--dedup-error`, shrink the job with `--limit` or
+> a narrower pattern, or use `--no-dedup` to stream without dropping anything.
 
 ---
 
@@ -304,10 +311,12 @@ When `--min-len`, `--max-len`, `--filter`, or deduplication are in play the fina
 is not knowable up front, so bitbrew shows a plain counter instead of a percentage bar
 that could never reach 100%.
 
-**Interrupted?** Pressing `Ctrl+C` during file output stops generation promptly, removes
-the partial file, and exits with code `130`.
+**Interrupted?** Pressing `Ctrl+C` stops generation promptly and exits with code `130`,
+whether the run is writing to a file, streaming to stdout, or counting. File output removes
+its partial file first. A run interrupted mid-`--compress` leaves a valid archive of however
+much it had finished, and the non-zero exit code tells you it is a prefix, not the whole list.
 
-**Atomic output:** bitbrew builds into a `<output>.part` sidecar and renames it into place
+**Atomic output:** bitbrew builds into a `<output>.<random>.part` sidecar and renames it into place
 only once the run completes. An interrupted or failed run — a full disk, a permissions
 error — leaves no truncated wordlist at your output path.
 
