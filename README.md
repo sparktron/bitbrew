@@ -329,6 +329,11 @@ Placement is create-only unless you pass `--overwrite`, so a file that appears a
 path *while the run is going* is refused rather than clobbered. On a long run that window is
 hours wide; the check at startup is only a courtesy fast-fail.
 
+On filesystems with no hard links (FAT, some network mounts) there is no create-only publication
+primitive, so the check is instead made immediately before the rename. The refusal is best-effort
+there rather than atomic — but the output path is still never created until the finished wordlist
+is what lands on it.
+
 ---
 
 ### Safety flags

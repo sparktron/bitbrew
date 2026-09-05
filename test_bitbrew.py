@@ -1927,3 +1927,89 @@ class TestPlaceOutput:
         with open(outfile, encoding="utf-8") as handle:
             assert sorted(handle.read().split()) == ["ax", "ay"]
         assert not _sidecars(tmp_path)
+
+
+class TestFallbackPublishesNothingEmpty:
+    """The no-hard-links fallback must never expose an empty output path.
+
+    Reserving the path with an exclusive create would refuse an existing file
+    atomically, but it publishes a zero-byte file first: a concurrent reader
+    sees an apparently finished wordlist, and a rename failure leaves that
+    empty file behind for good -- where it then blocks the retry.
+    """
+
+    NO_LINKS = OSError(errno.EPERM, "hard links not supported")
+
+    def test_destination_is_never_visible_empty(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """Sample the output path at the last instant before the rename."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        observed: dict[str, object] = {}
+        real_replace = os.replace
+
+        def observing_replace(src: str, dst: str) -> None:
+            observed["exists"] = os.path.exists(dst)
+            real_replace(src, dst)
+
+        with (
+            mock.patch("bitbrew.os.link", side_effect=self.NO_LINKS),
+            mock.patch("bitbrew.os.replace", side_effect=observing_replace),
+        ):
+            assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
+
+        assert observed["exists"] is False, "published an empty file before the payload"
+        with open(outfile, encoding="utf-8") as handle:
+            assert sorted(handle.read().split()) == ["ax", "ay"]
+
+    def test_failed_rename_leaves_no_output(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """A rename failure must not strand an empty file at the output path."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        with (
+            mock.patch("bitbrew.os.link", side_effect=self.NO_LINKS),
+            mock.patch(
+                "bitbrew.os.replace", side_effect=OSError(errno.EIO, "mount went away")
+            ),
+        ):
+            ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
+
+        assert ret == 1
+        assert "could not write" in capsys.readouterr().err
+        assert not os.path.exists(outfile), "empty output left at the destination"
+        assert not _sidecars(tmp_path)
+
+    def test_failed_rename_does_not_block_the_retry(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """The recovery path matters more than the failure: a retry must work."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        with (
+            mock.patch("bitbrew.os.link", side_effect=self.NO_LINKS),
+            mock.patch(
+                "bitbrew.os.replace", side_effect=OSError(errno.EIO, "mount went away")
+            ),
+        ):
+            assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 1
+
+        # No --overwrite, no manual cleanup: the same command must now succeed.
+        with mock.patch("bitbrew.os.link", side_effect=self.NO_LINKS):
+            assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
+        with open(outfile, encoding="utf-8") as handle:
+            assert sorted(handle.read().split()) == ["ax", "ay"]
+
+    def test_sidecar_removal_failure_is_not_a_failed_write(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """Once the link is made the output is published; tidying can fail."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        with mock.patch(
+            "bitbrew.os.remove", side_effect=OSError(errno.EPERM, "cannot unlink")
+        ):
+            ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
+
+        assert ret == 0, "reported a failed write for a published output"
+        assert "Wrote" in capsys.readouterr().err
+        with open(outfile, encoding="utf-8") as handle:
+            assert sorted(handle.read().split()) == ["ax", "ay"]

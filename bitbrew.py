@@ -624,6 +624,16 @@ def _create_sidecar(output_path: str) -> tuple[int, str]:
     )
 
 
+def _remove_if_exists(path: str) -> None:
+    """Delete a file, ignoring the case where it was never created.
+
+    Args:
+        path: Filesystem path to remove.
+    """
+    with contextlib.suppress(OSError):
+        os.remove(path)
+
+
 # Link failures that mean "this filesystem has no hard links" rather than
 # "this link cannot be made": FAT and some network mounts report these.
 _NO_HARDLINK_ERRNOS = frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS})
@@ -639,10 +649,14 @@ def _place_output(temp_path: str, output_path: str, overwrite: bool) -> None:
     directory, hence a filesystem, so the link is always valid wherever links
     exist at all.
 
-    Where they do not, the path is reserved with an exclusive create instead,
-    which refuses an existing file just as atomically. That is the weaker
-    option only in that a crash between the reservation and the rename leaves
-    an empty file behind.
+    Filesystems without hard links (FAT and friends) have no create-only
+    publication primitive at all: rename always clobbers. There the existence
+    check is made as late as possible and the rename follows immediately, which
+    narrows the window from the length of the run to the gap between two calls.
+    Reserving the path with an exclusive create would close that window, but
+    only by publishing an empty file at output_path first -- visible to any
+    reader as a finished wordlist, and left behind for good if the rename then
+    failed -- so the residual race is the smaller cost.
 
     Args:
         temp_path: The finished sidecar file.
@@ -663,20 +677,15 @@ def _place_output(temp_path: str, output_path: str, overwrite: bool) -> None:
     except OSError as exc:
         if exc.errno not in _NO_HARDLINK_ERRNOS:
             raise
-        os.close(os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
+        if os.path.exists(output_path):
+            raise FileExistsError(
+                errno.EEXIST, "output file already exists", output_path
+            ) from exc
         os.replace(temp_path, output_path)
         return
-    os.remove(temp_path)
-
-
-def _remove_if_exists(path: str) -> None:
-    """Delete a file, ignoring the case where it was never created.
-
-    Args:
-        path: Filesystem path to remove.
-    """
-    with contextlib.suppress(OSError):
-        os.remove(path)
+    # The output is published. Failing to drop the sidecar is untidy, not a
+    # failed write, and must not be reported as one.
+    _remove_if_exists(temp_path)
 
 
 _FORCE_THRESHOLD = 10_000_000  # combinations above which --force is required
