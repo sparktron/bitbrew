@@ -6,3 +6,6 @@ __pycache__/
 # Local artifacts / generated wordlists (not committed)
 abcd.txt
 words.txt
+
+# Sidecars from interrupted or crashed runs
+*.part

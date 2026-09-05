@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Generator, Iterable, Iterator
-from typing import Optional, Protocol
+from typing import NamedTuple, Optional, Protocol
 
 __version__ = "0.1.0"
 
@@ -419,6 +419,63 @@ def _text_writer(
 _STOP_CHECK_INTERVAL = 10_000  # words between should_stop() polls
 
 
+@contextlib.contextmanager
+def _interrupt_guard() -> Iterator[Callable[[], bool]]:
+    """Install a flag-setting SIGINT handler for the duration of the block.
+
+    Yields a predicate reporting whether an interrupt has arrived. Replacing the
+    default handler disarms KeyboardInterrupt, so *every* unbounded loop in the
+    run has to poll this predicate. Miss one and Ctrl-C is not merely late, it
+    is ignored outright.
+
+    Signal handlers can only be installed on the main thread. Off it, the block
+    runs under default KeyboardInterrupt behaviour and the predicate stays
+    False, so library callers get a working run rather than a ValueError.
+    """
+    interrupted = False
+
+    def handle(sig: int, frame: object) -> None:
+        nonlocal interrupted
+        interrupted = True
+
+    try:
+        old_handler = signal.signal(signal.SIGINT, handle)
+    except ValueError:
+        yield lambda: False
+        return
+    try:
+        yield lambda: interrupted
+    finally:
+        signal.signal(signal.SIGINT, old_handler)
+
+
+def _interruptible(
+    words: Iterable[str], should_stop: Callable[[], bool]
+) -> Generator[str, None, None]:
+    """Raise KeyboardInterrupt at the source once an interrupt has arrived.
+
+    This belongs on the generator rather than on the writer. Later stages can
+    discard every candidate they see -- a filter matching nothing is the
+    documented worst case -- and a poll that only runs per *written* word would
+    then never run at all, leaving the process deaf to Ctrl-C for the entire
+    walk of the pattern space.
+
+    Args:
+        words: The raw candidate stream.
+        should_stop: Predicate polled every _STOP_CHECK_INTERVAL candidates.
+
+    Yields:
+        Each candidate, unchanged.
+
+    Raises:
+        KeyboardInterrupt: When should_stop() returns True.
+    """
+    for seen, word in enumerate(words, 1):
+        if seen % _STOP_CHECK_INTERVAL == 0 and should_stop():
+            raise KeyboardInterrupt
+        yield word
+
+
 def _chunked_write(
     words: Iterable[str],
     file_obj: "gzip.GzipFile | io.TextIOBase | io.StringIO",
@@ -533,6 +590,46 @@ def _remove_if_exists(path: str) -> None:
 
 _FORCE_THRESHOLD = 10_000_000  # combinations above which --force is required
 _BLOOM_MAX_BYTES = 1 << 31  # 2 GiB ceiling on the approximate-dedup filter
+# How far the achievable false-positive rate may exceed the requested one before
+# the run is refused rather than quietly discarding valid words.
+_BLOOM_RATE_TOLERANCE = 10.0
+
+
+class _BloomSizing(NamedTuple):
+    """The filter a memory budget can actually provide."""
+
+    bits: int
+    hash_count: int
+    error_rate: float
+
+    @property
+    def size_bytes(self) -> int:
+        """Memory the bit array would occupy."""
+        return (self.bits + 7) // 8
+
+
+def _plan_bloom(capacity: int, error_rate: float, max_bytes: int) -> _BloomSizing:
+    """Size an approximate-dedup filter without allocating it.
+
+    Sizing is deliberately separate from allocation: the caller has to be able
+    to report the cost, and refuse a hopeless budget, before paying for what
+    may be a multi-gigabyte bit array.
+
+    Args:
+        capacity: Expected number of distinct items.
+        error_rate: Requested false-positive rate at that capacity.
+        max_bytes: Hard ceiling on memory.
+
+    Returns:
+        The bit count, probe count, and the rate actually achieved -- which is
+        worse than requested whenever the ceiling binds.
+    """
+    capacity = max(1, capacity)
+    ideal_bits = math.ceil(-capacity * math.log(error_rate) / (math.log(2) ** 2))
+    bits = max(8, min(ideal_bits, max_bytes * 8))
+    hash_count = max(1, round(bits / capacity * math.log(2)))
+    achieved = float((1.0 - math.exp(-hash_count * capacity / bits)) ** hash_count)
+    return _BloomSizing(bits, hash_count, achieved)
 
 
 class _BloomFilter:
@@ -545,21 +642,30 @@ class _BloomFilter:
     """
 
     def __init__(self, capacity: int, error_rate: float, max_bytes: int) -> None:
-        """Size a filter for the expected number of items.
+        """Size a filter for the expected number of items and allocate it.
 
         Args:
             capacity: Expected number of distinct items.
             error_rate: Target false-positive rate at that capacity.
             max_bytes: Hard ceiling on memory; the achieved rate degrades if the
-                ideal size would exceed it.
+                ideal size would exceed it. Callers that care should consult
+                _plan_bloom first -- see _dedup_stage.
+
+        Raises:
+            _CliError: If the bit array does not fit in available memory.
         """
         self.capacity = max(1, capacity)
-        ideal_bits = math.ceil(
-            -self.capacity * math.log(error_rate) / (math.log(2) ** 2)
-        )
-        self.bits = max(8, min(ideal_bits, max_bytes * 8))
-        self.hash_count = max(1, round(self.bits / self.capacity * math.log(2)))
-        self._array = bytearray((self.bits + 7) // 8)
+        self.plan = _plan_bloom(self.capacity, error_rate, max_bytes)
+        self.bits = self.plan.bits
+        self.hash_count = self.plan.hash_count
+        try:
+            self._array = bytearray(self.plan.size_bytes)
+        except MemoryError:
+            raise _CliError(
+                f"not enough memory for a {_human_bytes(self.plan.size_bytes)} "
+                f"deduplication filter. Raise --dedup-error, cut the work with "
+                f"--limit, or use --no-dedup to stream without deduplicating."
+            ) from None
 
     @property
     def size_bytes(self) -> int:
@@ -569,8 +675,7 @@ class _BloomFilter:
     @property
     def expected_error_rate(self) -> float:
         """False-positive rate this filter actually achieves at capacity."""
-        exponent = -self.hash_count * self.capacity / self.bits
-        return float((1.0 - math.exp(exponent)) ** self.hash_count)
+        return self.plan.error_rate
 
     def _positions(self, item: str) -> list[int]:
         """Derive this item's bit positions.
@@ -695,16 +800,16 @@ class _RunConfig:
     def dedup_capacity(self) -> int:
         """How many distinct words approximate deduplication must hold.
 
-        Deduplication runs before filtering and before --limit, so it only gets
-        to be limit-sized when nothing downstream can discard a candidate --
-        otherwise it can still see every word in the space.
+        Both dedup stages record exactly the words they emit, and --limit is
+        now the only stage downstream of them, so a limited run can never make
+        them track more than the limit. Filters no longer force the pessimistic
+        bound: they sit upstream, where the words they reject never reach dedup
+        at all.
 
         Returns:
             The capacity to size a Bloom filter for.
         """
         if self.limit is None:
-            return self.total_estimate
-        if self.min_len is not None or self.max_len is not None or self.regex is not None:
             return self.total_estimate
         return min(self.total_estimate, self.limit)
 
@@ -953,7 +1058,7 @@ def _resolve_options(args: argparse.Namespace) -> _RunConfig:
     )
 
 
-def _dedup_stage(words: Iterable[str], cfg: _RunConfig) -> Iterable[str]:
+def _dedup_stage(words: Iterator[str], cfg: _RunConfig) -> Iterator[str]:
     """Apply the configured deduplication strategy, reporting its cost.
 
     Args:
@@ -966,14 +1071,41 @@ def _dedup_stage(words: Iterable[str], cfg: _RunConfig) -> Iterable[str]:
     if cfg.dedup == "none":
         return words
     if cfg.dedup == "approx":
-        bloom = _BloomFilter(cfg.dedup_capacity, cfg.dedup_error, _BLOOM_MAX_BYTES)
+        # Size first. Past the ceiling the achievable rate climbs towards 1,
+        # at which point the filter judges nearly everything already-seen and
+        # discards most of the wordlist without any signal that it did. Refuse
+        # that instead of honouring --dedup-approx in name only.
+        plan = _plan_bloom(cfg.dedup_capacity, cfg.dedup_error, _BLOOM_MAX_BYTES)
+        if plan.error_rate > cfg.dedup_error * _BLOOM_RATE_TOLERANCE:
+            remedies = []
+            # Only worth suggesting when the parser would accept it (< 1) and
+            # it would actually clear this check. Once the ceiling binds hard
+            # the rate pins at 1 and no --dedup-error value rescues the run --
+            # only shrinking the input does.
+            if plan.error_rate < 1.0:
+                remedies.append(
+                    f"pass --dedup-error {plan.error_rate:.2g} to accept that rate"
+                )
+            remedies.append("reduce the work with --limit or a narrower pattern")
+            remedies.append("use --no-dedup to stream without dropping anything")
+            options = "".join(f"\n  - {remedy}" for remedy in remedies)
+            raise _CliError(
+                f"approximate deduplication of ~{cfg.dedup_capacity:,} words at a "
+                f"false-positive rate of {cfg.dedup_error:.2g} needs more than the "
+                f"{_human_bytes(_BLOOM_MAX_BYTES)} ceiling allows. The best rate "
+                f"within it is {plan.error_rate:.2g}, which would silently drop a "
+                f"large share of valid words.\nTry one of:{options}"
+            )
+        # Report the cost before allocating it, not after.
         print(
-            f"Note: approximate deduplication in {_human_bytes(bloom.size_bytes)}, "
-            f"expected false-positive rate {bloom.expected_error_rate:.2g}. "
+            f"Note: approximate deduplication in {_human_bytes(plan.size_bytes)}, "
+            f"expected false-positive rate {plan.error_rate:.2g}. "
             f"Some valid words may be dropped.",
             file=sys.stderr,
         )
-        return _deduplicated_approx(words, bloom)
+        return _deduplicated_approx(
+            words, _BloomFilter(cfg.dedup_capacity, cfg.dedup_error, _BLOOM_MAX_BYTES)
+        )
     if cfg.total_estimate > _DEDUP_WARN_THRESHOLD:
         print(
             f"Warning: deduplicating ~{cfg.total_estimate:,} words holds them all in "
@@ -984,11 +1116,14 @@ def _dedup_stage(words: Iterable[str], cfg: _RunConfig) -> Iterable[str]:
     return _deduplicated(words)
 
 
-def _build_pipeline(cfg: _RunConfig) -> Iterator[str]:
-    """Compose the full generate-dedup-filter-limit stream.
+def _build_pipeline(
+    cfg: _RunConfig, should_stop: Callable[[], bool] | None = None
+) -> Iterator[str]:
+    """Compose the full generate-filter-dedup-limit stream.
 
     Args:
         cfg: Resolved run configuration.
+        should_stop: Optional interrupt predicate, polled at the source.
 
     Returns:
         The finished word stream.
@@ -998,8 +1133,16 @@ def _build_pipeline(cfg: _RunConfig) -> Iterator[str]:
         for pattern in cfg.patterns:
             yield from _expand_pattern(pattern, cfg.charset)
 
-    words = _apply_filters(
-        _dedup_stage(expand(), cfg), cfg.min_len, cfg.max_len, cfg.regex
+    source: Iterable[str] = expand()
+    if should_stop is not None:
+        source = _interruptible(source, should_stop)
+
+    # Filter before dedup. Both stages are per-word and order-preserving, so
+    # the output is identical either way, but this keeps rejected candidates
+    # out of the dedup set entirely -- its memory then tracks the output rather
+    # than the whole pattern space, which is the tool's real scaling limit.
+    words = _dedup_stage(
+        _apply_filters(source, cfg.min_len, cfg.max_len, cfg.regex), cfg
     )
     if cfg.limit is not None:
         return itertools.islice(words, cfg.limit)
@@ -1026,12 +1169,15 @@ def _make_progress(cfg: _RunConfig) -> _ProgressBar | None:
     return bar
 
 
-def _write_to_file(words: Iterable[str], cfg: _RunConfig) -> int:
+def _write_to_file(
+    words: Iterable[str], cfg: _RunConfig, should_stop: Callable[[], bool]
+) -> int:
     """Generate into cfg.output_path atomically and interruptibly.
 
     Args:
         words: The finished word stream.
         cfg: Resolved run configuration.
+        should_stop: Interrupt predicate owned by the caller's _interrupt_guard.
 
     Returns:
         Process exit code.
@@ -1039,14 +1185,6 @@ def _write_to_file(words: Iterable[str], cfg: _RunConfig) -> int:
     if cfg.output_path is None:
         raise ValueError("_write_to_file requires an output path")
     output_path = cfg.output_path
-
-    interrupted = False
-
-    def handle_interrupt(sig: int, frame: object) -> None:
-        nonlocal interrupted
-        interrupted = True
-
-    old_handler = signal.signal(signal.SIGINT, handle_interrupt)
 
     # Build into a sidecar file and rename on success, so an interrupted or
     # failed run never leaves a truncated wordlist at output_path. The sidecar
@@ -1067,19 +1205,19 @@ def _write_to_file(words: Iterable[str], cfg: _RunConfig) -> int:
                 gzip.GzipFile(fileobj=raw, mode="wb") as binary,
             ):
                 written = _chunked_write(
-                    words, binary, cfg.chunk_size, progress, lambda: interrupted
+                    words, binary, cfg.chunk_size, progress, should_stop
                 )
         else:
             with os.fdopen(handle, "w", encoding="utf-8") as text:
                 written = _chunked_write(
-                    words, text, cfg.chunk_size, progress, lambda: interrupted
+                    words, text, cfg.chunk_size, progress, should_stop
                 )
 
         if progress is not None:
             progress.close()
 
         # A signal can still land between the last poll and here.
-        if interrupted:
+        if should_stop():
             raise KeyboardInterrupt
 
         # mkstemp creates 0600; give the finished file the mode a plain open()
@@ -1100,12 +1238,27 @@ def _write_to_file(words: Iterable[str], cfg: _RunConfig) -> int:
     finally:
         if progress is not None:
             progress.close()
-        signal.signal(signal.SIGINT, old_handler)
     return 0
+
+
+def _detach_stdout() -> None:
+    """Point stdout at the null device after the reader has gone away.
+
+    Python flushes stdout again during interpreter shutdown; on a closed pipe
+    that raises a second BrokenPipeError and prints "Exception ignored" noise
+    after an otherwise ordinary `| head`.
+    """
+    with contextlib.suppress(OSError, ValueError):
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
 
 
 def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
     """Stream words to stdout, gzipped when asked.
+
+    Exit codes match the -o path: 130 when interrupted, 1 when the write
+    fails. A closed downstream pipe is the one success case -- `| head`
+    getting what it asked for is not an error.
 
     Args:
         words: The finished word stream.
@@ -1115,11 +1268,19 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
         Process exit code.
     """
     if not cfg.use_compress:
+        # BrokenPipeError subclasses OSError, so it has to be caught first.
         try:
             for word in words:
                 print(word)
-        except (BrokenPipeError, KeyboardInterrupt):
+        except BrokenPipeError:
+            _detach_stdout()
             return 0
+        except KeyboardInterrupt:
+            print("\nInterrupted.", file=sys.stderr)
+            return 130
+        except OSError as exc:
+            print(f"Error: could not write to stdout: {exc}", file=sys.stderr)
+            return 1
         return 0
 
     # Gzip to stdout, but never at a terminal -- binary down a TTY is noise.
@@ -1140,8 +1301,21 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
     try:
         with gzip.GzipFile(fileobj=raw, mode="wb") as binary:
             _chunked_write(words, binary, cfg.chunk_size)
-    except (BrokenPipeError, KeyboardInterrupt):
+    except BrokenPipeError:
+        _detach_stdout()
         return 0
+    except KeyboardInterrupt:
+        # The stream stops mid-member, so it will not decompress. Reporting
+        # success here would let `bitbrew ... > out.gz && use out.gz` run on
+        # a truncated archive.
+        print(
+            "\nInterrupted. Compressed output is incomplete.",
+            file=sys.stderr,
+        )
+        return 130
+    except OSError as exc:
+        print(f"Error: could not write to stdout: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -1177,14 +1351,26 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    words = _build_pipeline(cfg)
+    # The guard spans generation as well as writing: with a restrictive filter
+    # the pipeline can run for hours without emitting a word, and that stretch
+    # has to stay interruptible too.
+    with _interrupt_guard() as should_stop:
+        try:
+            words = _build_pipeline(cfg, should_stop)
+        except _CliError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
-    if cfg.count_only:
-        print(sum(1 for _ in words))
-        return 0
-    if cfg.output_path:
-        return _write_to_file(words, cfg)
-    return _write_to_stdout(words, cfg)
+        if cfg.count_only:
+            try:
+                print(sum(1 for _ in words))
+            except KeyboardInterrupt:
+                print("\nInterrupted.", file=sys.stderr)
+                return 130
+            return 0
+        if cfg.output_path:
+            return _write_to_file(words, cfg, should_stop)
+        return _write_to_stdout(words, cfg)
 
 
 if __name__ == "__main__":
