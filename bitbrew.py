@@ -1064,7 +1064,15 @@ def _resolve_options(args: argparse.Namespace) -> _RunConfig:
         total_estimate += estimate_count(pattern, len(charset))
 
     output_path = args.output
-    if output_path:
+    # --count prints to stdout and never opens the output path, so validating
+    # it would refuse runs that cannot touch a file: `--count -o existing.txt`
+    # asked about a write that is not going to happen.
+    if output_path and args.count:
+        print(
+            "Warning: --count prints to stdout; -o is ignored.",
+            file=sys.stderr,
+        )
+    elif output_path:
         output_dir = os.path.dirname(output_path)
         if output_dir and not os.path.isdir(output_dir):
             raise _CliError(f"output directory '{output_dir}' does not exist.")

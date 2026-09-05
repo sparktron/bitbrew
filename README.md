@@ -380,7 +380,7 @@ usage: bitbrew [-h] [--version] -p PATTERN [-o OUTPUT] [--charset CHARSET]
 | `--max-len` | Maximum word length (inclusive) |
 | `--filter` | Python regex; only matching words are kept |
 | `--limit` | Stop after N words |
-| `--count` | Print word count only — no words emitted |
+| `--count` | Print word count only — no words emitted; `-o` is ignored |
 | `--compress` | Write gzip-compressed output |
 | `--chunk-size` | Words per streaming chunk (default: `10000`) |
 | `--force` | Allow >10 M combinations |

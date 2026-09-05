@@ -1655,3 +1655,55 @@ class TestReadmeExamples:
         assert len(seen) == 1
         assert seen[0] != "words.txt.part", "the documented name was the real one"
         assert re.fullmatch(r"words\.txt\.\w+\.part", seen[0]), seen[0]
+
+
+class TestCountIgnoresOutputPath:
+    """--count prints to stdout, so the output path must not gate the run."""
+
+    def test_count_runs_with_existing_output_file(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """An existing -o file cannot be harmed by a count, so it must not refuse."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        with open(outfile, "w", encoding="utf-8") as handle:
+            handle.write("pre-existing\n")
+
+        ret = main(["-p", "**", "--charset", "ab", "--count", "-o", outfile])
+
+        captured = capsys.readouterr()
+        assert ret == 0
+        assert captured.out.strip() == "4"
+        assert "-o is ignored" in captured.err
+        with open(outfile, encoding="utf-8") as handle:
+            assert handle.read() == "pre-existing\n", "count touched the output file"
+
+    def test_count_runs_with_missing_output_directory(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The directory check is equally moot when nothing is written."""
+        ret = main(["-p", "**", "--charset", "ab", "--count", "-o", "/no/such/dir/f.txt"])
+        captured = capsys.readouterr()
+        assert ret == 0
+        assert captured.out.strip() == "4"
+
+    def test_count_without_output_warns_nothing(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The warning belongs to the -o combination, not to --count itself."""
+        assert main(["-p", "**", "--charset", "ab", "--count"]) == 0
+        assert "-o is ignored" not in capsys.readouterr().err
+
+    def test_write_path_still_refuses_existing_file(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """Relaxing the guard for --count must not relax it for a real write."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        with open(outfile, "w", encoding="utf-8") as handle:
+            handle.write("pre-existing\n")
+
+        ret = main(["-p", "**", "--charset", "ab", "-o", outfile])
+
+        assert ret == 1
+        assert "already exists" in capsys.readouterr().err
+        with open(outfile, encoding="utf-8") as handle:
+            assert handle.read() == "pre-existing\n"
