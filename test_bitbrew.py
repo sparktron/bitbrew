@@ -11,7 +11,6 @@ import signal
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 import types
 from unittest import mock
@@ -375,7 +374,7 @@ class TestGzipCorruptionAndPermissionErrors:
         outfile = str(tmp_path / "words.txt")
         # Creating the sidecar is the first thing that touches the filesystem.
         with mock.patch(
-            "bitbrew.tempfile.mkstemp", side_effect=PermissionError("Permission denied")
+            "bitbrew._create_sidecar", side_effect=PermissionError("Permission denied")
         ):
             ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
         assert ret == 1
@@ -865,7 +864,7 @@ class TestAuditFixes:
     ) -> None:
         """OSError during file write should return 1 with a message, not crash."""
         outfile = str(tmp_path / "words.txt")
-        with mock.patch("bitbrew.tempfile.mkstemp", side_effect=OSError("disk full")):
+        with mock.patch("bitbrew._create_sidecar", side_effect=OSError("disk full")):
             ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
         assert ret == 1
         assert "could not write" in capsys.readouterr().err
@@ -1580,14 +1579,14 @@ class TestReviewFindings:
         """Two runs targeting one output must not collide on the temp path."""
         outfile = os.path.join(str(tmp_path), "words.txt")
         seen: list[str] = []
-        real_mkstemp = tempfile.mkstemp
+        real_create = bitbrew._create_sidecar
 
-        def recording_mkstemp(*args: object, **kwargs: object):
-            handle, path = real_mkstemp(*args, **kwargs)  # type: ignore[arg-type]
-            seen.append(path)
-            return handle, path
+        def recording_create(path: str) -> tuple[int, str]:
+            handle, temp_path = real_create(path)
+            seen.append(temp_path)
+            return handle, temp_path
 
-        with mock.patch("bitbrew.tempfile.mkstemp", side_effect=recording_mkstemp):
+        with mock.patch("bitbrew._create_sidecar", side_effect=recording_create):
             assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
             assert main(["-p", "b*", "--charset", "xy", "-o", outfile,
                          "--overwrite"]) == 0
@@ -1595,12 +1594,35 @@ class TestReviewFindings:
         assert seen[0] != seen[1], "both runs used the same sidecar path"
 
     def test_output_is_world_readable(self, tmp_path: "os.PathLike[str]") -> None:
-        """mkstemp creates 0600; the finished file must not inherit that."""
+        """The finished file must carry the mode a plain open() would produce."""
         outfile = os.path.join(str(tmp_path), "words.txt")
         assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
+
+        # Compare against a file the interpreter creates the ordinary way,
+        # rather than recomputing the umask arithmetic the fix removed.
+        reference = os.path.join(str(tmp_path), "reference.txt")
+        with open(reference, "w", encoding="utf-8") as handle:
+            handle.write("x")
+
         mode = stat.S_IMODE(os.stat(outfile).st_mode)
-        expected = 0o666 & ~bitbrew._current_umask()
+        expected = stat.S_IMODE(os.stat(reference).st_mode)
         assert mode == expected, f"got {mode:o}, expected {expected:o}"
+
+    def test_writing_never_touches_the_process_umask(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """Reading the umask means setting it, widening it for every thread."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        calls: list[int] = []
+
+        def recording_umask(mask: int) -> int:
+            calls.append(mask)
+            raise AssertionError("os.umask called on the write path")
+
+        with mock.patch("bitbrew.os.umask", side_effect=recording_umask):
+            assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
+
+        assert calls == []
 
 
 class TestReadmeExamples:
@@ -1637,21 +1659,357 @@ class TestReadmeExamples:
     def test_sidecar_name_is_documented_accurately(
         self, tmp_path: "os.PathLike[str]"
     ) -> None:
-        """mkstemp inserts a random component, so `<output>.part` is not the name."""
+        """The sidecar carries a random component, so `<output>.part` is not it."""
         assert "`<output>.<random>.part`" in self._readme()
 
         outfile = os.path.join(str(tmp_path), "words.txt")
         seen: list[str] = []
-        real_mkstemp = tempfile.mkstemp
+        real_create = bitbrew._create_sidecar
 
-        def recording_mkstemp(*args: object, **kwargs: object):
-            handle, path = real_mkstemp(*args, **kwargs)  # type: ignore[arg-type]
-            seen.append(os.path.basename(path))
-            return handle, path
+        def recording_create(path: str) -> tuple[int, str]:
+            handle, temp_path = real_create(path)
+            seen.append(os.path.basename(temp_path))
+            return handle, temp_path
 
-        with mock.patch("bitbrew.tempfile.mkstemp", side_effect=recording_mkstemp):
+        with mock.patch("bitbrew._create_sidecar", side_effect=recording_create):
             assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
 
         assert len(seen) == 1
         assert seen[0] != "words.txt.part", "the documented name was the real one"
         assert re.fullmatch(r"words\.txt\.\w+\.part", seen[0]), seen[0]
+
+
+class TestCountIgnoresOutputPath:
+    """--count prints to stdout, so the output path must not gate the run."""
+
+    def test_count_runs_with_existing_output_file(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """An existing -o file cannot be harmed by a count, so it must not refuse."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        with open(outfile, "w", encoding="utf-8") as handle:
+            handle.write("pre-existing\n")
+
+        ret = main(["-p", "**", "--charset", "ab", "--count", "-o", outfile])
+
+        captured = capsys.readouterr()
+        assert ret == 0
+        assert captured.out.strip() == "4"
+        assert "-o is ignored" in captured.err
+        with open(outfile, encoding="utf-8") as handle:
+            assert handle.read() == "pre-existing\n", "count touched the output file"
+
+    def test_count_runs_with_missing_output_directory(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The directory check is equally moot when nothing is written."""
+        ret = main(["-p", "**", "--charset", "ab", "--count", "-o", "/no/such/dir/f.txt"])
+        captured = capsys.readouterr()
+        assert ret == 0
+        assert captured.out.strip() == "4"
+
+    def test_count_without_output_warns_nothing(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The warning belongs to the -o combination, not to --count itself."""
+        assert main(["-p", "**", "--charset", "ab", "--count"]) == 0
+        assert "-o is ignored" not in capsys.readouterr().err
+
+    def test_write_path_still_refuses_existing_file(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """Relaxing the guard for --count must not relax it for a real write."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        with open(outfile, "w", encoding="utf-8") as handle:
+            handle.write("pre-existing\n")
+
+        ret = main(["-p", "**", "--charset", "ab", "-o", outfile])
+
+        assert ret == 1
+        assert "already exists" in capsys.readouterr().err
+        with open(outfile, encoding="utf-8") as handle:
+            assert handle.read() == "pre-existing\n"
+
+
+class TestSidecarCreation:
+    """The sidecar is created exclusively, at the mode a plain open() gives."""
+
+    def test_create_sidecar_is_exclusive(self, tmp_path: "os.PathLike[str]") -> None:
+        """Two sidecars for one output must be distinct, live files."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        first_fd, first = bitbrew._create_sidecar(outfile)
+        second_fd, second = bitbrew._create_sidecar(outfile)
+        try:
+            assert first != second
+            assert os.path.exists(first) and os.path.exists(second)
+            assert os.path.dirname(first) == str(tmp_path)
+            assert re.fullmatch(r"words\.txt\.[0-9a-f]+\.part", os.path.basename(first))
+        finally:
+            os.close(first_fd)
+            os.close(second_fd)
+
+    def test_create_sidecar_refuses_an_existing_path(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """O_EXCL is what keeps an unrelated leftover file from being truncated."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        with mock.patch("bitbrew.secrets.token_hex", return_value="deadbeef"):
+            handle, path = bitbrew._create_sidecar(outfile)
+            os.close(handle)
+            with open(path, "w", encoding="utf-8") as existing:
+                existing.write("irreplaceable")
+
+            # Every attempt now generates the same taken name.
+            with pytest.raises(OSError) as excinfo:
+                bitbrew._create_sidecar(outfile)
+
+        assert excinfo.value.errno == errno.EEXIST
+        with open(path, encoding="utf-8") as existing:
+            assert existing.read() == "irreplaceable"
+
+    def test_create_sidecar_uses_the_ambient_umask(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """The kernel applies the umask, so no correcting chmod is needed."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        previous = os.umask(0o027)
+        try:
+            handle, path = bitbrew._create_sidecar(outfile)
+            os.close(handle)
+            assert stat.S_IMODE(os.stat(path).st_mode) == 0o640
+        finally:
+            os.umask(previous)
+
+    def test_sidecar_creation_does_not_read_the_umask(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """os.umask(0) would widen permissions for every concurrent thread."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        with mock.patch("bitbrew.os.umask", side_effect=AssertionError("umask read")):
+            handle, _ = bitbrew._create_sidecar(outfile)
+        os.close(handle)
+
+
+class TestOverwriteRace:
+    """The overwrite guard must hold even against the TOCTOU window.
+
+    The resolve-time check can pass and then a file can appear before the
+    output is placed -- a gap of hours on a large run. Placement itself must
+    refuse to clobber it.
+    """
+
+    @staticmethod
+    def _resolve_then_plant(outfile: str, contents: str):
+        """Wrap _resolve_options so a file appears right after the guard runs."""
+        real_resolve = bitbrew._resolve_options
+
+        def wrapper(args: object) -> object:
+            cfg = real_resolve(args)  # the guard runs here and sees nothing
+            with open(outfile, "w", encoding="utf-8") as handle:
+                handle.write(contents)
+            return cfg
+
+        return wrapper
+
+    def test_file_appearing_after_guard_is_not_clobbered(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        plant = self._resolve_then_plant(outfile, "concurrent data")
+
+        with mock.patch("bitbrew._resolve_options", side_effect=plant):
+            ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
+
+        assert ret == 1
+        assert "already exists" in capsys.readouterr().err
+        with open(outfile, encoding="utf-8") as handle:
+            assert handle.read() == "concurrent data", "clobbered a file mid-run"
+        assert not _sidecars(tmp_path), "left a sidecar behind"
+
+    def test_overwrite_wins_the_race(self, tmp_path: "os.PathLike[str]") -> None:
+        """With --overwrite, a file appearing in the window is still replaced."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        plant = self._resolve_then_plant(outfile, "stale")
+
+        with mock.patch("bitbrew._resolve_options", side_effect=plant):
+            ret = main(["-p", "a*", "--charset", "xy", "-o", outfile, "--overwrite"])
+
+        assert ret == 0
+        with open(outfile, encoding="utf-8") as handle:
+            assert sorted(handle.read().split()) == ["ax", "ay"]
+        assert not _sidecars(tmp_path)
+
+
+class TestPlaceOutput:
+    """The placement primitive, including its no-hard-links fallback."""
+
+    @staticmethod
+    def _pair(tmp_path: "os.PathLike[str]", dst_contents: str | None = None):
+        src = os.path.join(str(tmp_path), "src.part")
+        dst = os.path.join(str(tmp_path), "dst.txt")
+        with open(src, "w", encoding="utf-8") as handle:
+            handle.write("payload")
+        if dst_contents is not None:
+            with open(dst, "w", encoding="utf-8") as handle:
+                handle.write(dst_contents)
+        return src, dst
+
+    def test_create_only_refuses_existing(self, tmp_path: "os.PathLike[str]") -> None:
+        src, dst = self._pair(tmp_path, "existing")
+        with pytest.raises(FileExistsError):
+            bitbrew._place_output(src, dst, overwrite=False)
+        with open(dst, encoding="utf-8") as handle:
+            assert handle.read() == "existing"
+
+    def test_create_only_delivers_when_absent(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        src, dst = self._pair(tmp_path)
+        bitbrew._place_output(src, dst, overwrite=False)
+        with open(dst, encoding="utf-8") as handle:
+            assert handle.read() == "payload"
+        assert not os.path.exists(src), "sidecar not removed after create-only place"
+
+    def test_overwrite_replaces(self, tmp_path: "os.PathLike[str]") -> None:
+        src, dst = self._pair(tmp_path, "existing")
+        bitbrew._place_output(src, dst, overwrite=True)
+        with open(dst, encoding="utf-8") as handle:
+            assert handle.read() == "payload"
+        assert not os.path.exists(src)
+
+    def test_fallback_refuses_existing_without_hard_links(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """On FAT and friends the reservation must refuse just as firmly."""
+        src, dst = self._pair(tmp_path, "existing")
+        no_links = OSError(errno.EPERM, "hard links not supported")
+        with (
+            mock.patch("bitbrew.os.link", side_effect=no_links),
+            pytest.raises(FileExistsError),
+        ):
+            bitbrew._place_output(src, dst, overwrite=False)
+        with open(dst, encoding="utf-8") as handle:
+            assert handle.read() == "existing"
+
+    def test_fallback_delivers_when_absent(self, tmp_path: "os.PathLike[str]") -> None:
+        """A filesystem without hard links must still get its output."""
+        src, dst = self._pair(tmp_path)
+        no_links = OSError(errno.EOPNOTSUPP, "hard links not supported")
+        with mock.patch("bitbrew.os.link", side_effect=no_links):
+            bitbrew._place_output(src, dst, overwrite=False)
+        with open(dst, encoding="utf-8") as handle:
+            assert handle.read() == "payload"
+        assert not os.path.exists(src)
+
+    def test_unrelated_link_error_is_not_swallowed(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """Only "no hard links here" earns the fallback; other errors surface."""
+        src, dst = self._pair(tmp_path)
+        with (
+            mock.patch(
+                "bitbrew.os.link", side_effect=OSError(errno.EXDEV, "cross-device link")
+            ),
+            pytest.raises(OSError) as excinfo,
+        ):
+            bitbrew._place_output(src, dst, overwrite=False)
+        assert excinfo.value.errno == errno.EXDEV
+        assert not os.path.exists(dst)
+
+    def test_write_path_survives_a_filesystem_without_hard_links(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """End to end: a full run completes where os.link is unavailable."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        no_links = OSError(errno.EPERM, "hard links not supported")
+        with mock.patch("bitbrew.os.link", side_effect=no_links):
+            assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
+        with open(outfile, encoding="utf-8") as handle:
+            assert sorted(handle.read().split()) == ["ax", "ay"]
+        assert not _sidecars(tmp_path)
+
+
+class TestFallbackPublishesNothingEmpty:
+    """The no-hard-links fallback must never expose an empty output path.
+
+    Reserving the path with an exclusive create would refuse an existing file
+    atomically, but it publishes a zero-byte file first: a concurrent reader
+    sees an apparently finished wordlist, and a rename failure leaves that
+    empty file behind for good -- where it then blocks the retry.
+    """
+
+    NO_LINKS = OSError(errno.EPERM, "hard links not supported")
+
+    def test_destination_is_never_visible_empty(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """Sample the output path at the last instant before the rename."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        observed: dict[str, object] = {}
+        real_replace = os.replace
+
+        def observing_replace(src: str, dst: str) -> None:
+            observed["exists"] = os.path.exists(dst)
+            real_replace(src, dst)
+
+        with (
+            mock.patch("bitbrew.os.link", side_effect=self.NO_LINKS),
+            mock.patch("bitbrew.os.replace", side_effect=observing_replace),
+        ):
+            assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
+
+        assert observed["exists"] is False, "published an empty file before the payload"
+        with open(outfile, encoding="utf-8") as handle:
+            assert sorted(handle.read().split()) == ["ax", "ay"]
+
+    def test_failed_rename_leaves_no_output(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """A rename failure must not strand an empty file at the output path."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        with (
+            mock.patch("bitbrew.os.link", side_effect=self.NO_LINKS),
+            mock.patch(
+                "bitbrew.os.replace", side_effect=OSError(errno.EIO, "mount went away")
+            ),
+        ):
+            ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
+
+        assert ret == 1
+        assert "could not write" in capsys.readouterr().err
+        assert not os.path.exists(outfile), "empty output left at the destination"
+        assert not _sidecars(tmp_path)
+
+    def test_failed_rename_does_not_block_the_retry(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """The recovery path matters more than the failure: a retry must work."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        with (
+            mock.patch("bitbrew.os.link", side_effect=self.NO_LINKS),
+            mock.patch(
+                "bitbrew.os.replace", side_effect=OSError(errno.EIO, "mount went away")
+            ),
+        ):
+            assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 1
+
+        # No --overwrite, no manual cleanup: the same command must now succeed.
+        with mock.patch("bitbrew.os.link", side_effect=self.NO_LINKS):
+            assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
+        with open(outfile, encoding="utf-8") as handle:
+            assert sorted(handle.read().split()) == ["ax", "ay"]
+
+    def test_sidecar_removal_failure_is_not_a_failed_write(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """Once the link is made the output is published; tidying can fail."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        with mock.patch(
+            "bitbrew.os.remove", side_effect=OSError(errno.EPERM, "cannot unlink")
+        ):
+            ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
+
+        assert ret == 0, "reported a failed write for a published output"
+        assert "Wrote" in capsys.readouterr().err
+        with open(outfile, encoding="utf-8") as handle:
+            assert sorted(handle.read().split()) == ["ax", "ay"]

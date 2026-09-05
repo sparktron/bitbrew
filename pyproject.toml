@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 
 [project.optional-dependencies]
 progress = ["tqdm"]
-dev = ["pytest", "ruff", "mypy"]
+dev = ["pytest", "pytest-cov", "ruff", "mypy"]
 
 [project.scripts]
 bitbrew = "bitbrew:main"
@@ -23,6 +23,15 @@ py-modules = ["bitbrew"]
 # Single source of truth: bitbrew.py stays runnable as a standalone script.
 [tool.setuptools.dynamic]
 version = {attr = "bitbrew.__version__"}
+
+[tool.coverage.run]
+source = ["bitbrew"]
+
+[tool.coverage.report]
+# The uncovered remainder is dominated by defensive branches that need a
+# failing kernel call to reach. Raise this as those get covered, never lower it.
+fail_under = 93
+show_missing = true
 
 [tool.mypy]
 python_version = "3.10"

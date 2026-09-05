@@ -325,6 +325,15 @@ much it had finished, and the non-zero exit code tells you it is a prefix, not t
 only once the run completes. An interrupted or failed run — a full disk, a permissions
 error — leaves no truncated wordlist at your output path.
 
+Placement is create-only unless you pass `--overwrite`, so a file that appears at your output
+path *while the run is going* is refused rather than clobbered. On a long run that window is
+hours wide; the check at startup is only a courtesy fast-fail.
+
+On filesystems with no hard links (FAT, some network mounts) there is no create-only publication
+primitive, so the check is instead made immediately before the rename. The refusal is best-effort
+there rather than atomic — but the output path is still never created until the finished wordlist
+is what lands on it.
+
 ---
 
 ### Safety flags
@@ -332,7 +341,7 @@ error — leaves no truncated wordlist at your output path.
 | Flag | Purpose |
 |------|---------|
 | `--force` | Required when estimated output exceeds 10 M words |
-| `--overwrite` | Required to overwrite an existing output file |
+| `--overwrite` | Required to overwrite an existing output file, whether it was there at startup or appeared mid-run |
 
 ---
 
@@ -380,7 +389,7 @@ usage: bitbrew [-h] [--version] -p PATTERN [-o OUTPUT] [--charset CHARSET]
 | `--max-len` | Maximum word length (inclusive) |
 | `--filter` | Python regex; only matching words are kept |
 | `--limit` | Stop after N words |
-| `--count` | Print word count only — no words emitted |
+| `--count` | Print word count only — no words emitted; `-o` is ignored |
 | `--compress` | Write gzip-compressed output |
 | `--chunk-size` | Words per streaming chunk (default: `10000`) |
 | `--force` | Allow >10 M combinations |
@@ -407,6 +416,12 @@ on Python 3.10–3.13:
 ```bash
 ruff check .
 mypy
+```
+
+Coverage is measured on every run and gated at 93%:
+
+```bash
+python -m pytest --cov=bitbrew --cov-report=term-missing
 ```
 
 The test suite covers:
