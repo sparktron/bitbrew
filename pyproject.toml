@@ -24,9 +24,6 @@ py-modules = ["bitbrew"]
 [tool.setuptools.dynamic]
 version = {attr = "bitbrew.__version__"}
 
-[tool.pytest.ini_options]
-testpaths = ["test_bitbrew.py"]
-
 [tool.mypy]
 python_version = "3.10"
 strict = true

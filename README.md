@@ -168,14 +168,16 @@ A `--filter` regex runs against every generated word, so one that backtracks
 catastrophically turns a short run into an unbounded hang. bitbrew screens each filter in
 two ways before generating anything:
 
-1. **Structural check** — rejects nested quantifiers such as `(a+)+` or `(\d+)+`.
+1. **Structural check** — linearly scans for nested quantifiers such as `(a+)+` or
+   `(\d+)+`, while treating escapes and character-class contents as literals.
 2. **Timing probe** — matches the regex against a short ladder of adversarial inputs built
    from the pattern's own alphabet and rejects it if the time grows exponentially. This
    catches the overlapping-alternation family, like `(a|a)+$` and `(a|b|ab)*$`, that no
    structural check sees.
 
-The probe costs well under a millisecond for a normal filter and gives up as soon as its
-own time budget is spent, so screening a pathological pattern is bounded too.
+The probe costs well under a millisecond for a normal filter and stops after a match pushes
+its cumulative work over the time budget. The structural pass itself is linear, including
+for malformed patterns; syntax errors are then reported by Python's regex compiler.
 
 ```bash
 $ bitbrew -p "***" --filter "(a|a)+$"
@@ -230,6 +232,9 @@ bitbrew -p "admin*" -p "root*" --charset all --force --dedup-approx -o wordlist.
 > your wordlist disappears with nothing to show it happened. The error names the best rate
 > that does fit, so you can accept it with `--dedup-error`, shrink the job with `--limit` or
 > a narrower pattern, or use `--no-dedup` to stream without dropping anything.
+
+Ctrl-C raises an interrupt immediately, including while an explicitly allowed unsafe regex is
+evaluating; file output still removes its temporary sidecar before returning exit status 130.
 
 ---
 
@@ -392,7 +397,7 @@ usage: bitbrew [-h] [--version] -p PATTERN [-o OUTPUT] [--charset CHARSET]
 
 ```bash
 pip install -e ".[dev,progress]"
-python -m pytest test_bitbrew.py -v
+python -m pytest -v
 ```
 
 Linting uses [ruff](https://docs.astral.sh/ruff/) and type-checking uses
