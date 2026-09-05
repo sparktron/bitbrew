@@ -243,23 +243,6 @@ def _expand_pattern(pattern: str, chars: str) -> Generator[str, None, None]:
         )
 
 
-_REDOS_PATTERN = re.compile(
-    r"""
-    \(               # opening group
-    (?:[^()]*         # group contents (non-nested)
-       |\[.*?\]       # or character classes
-    )*
-    [+*]\??          # inner quantifier (+ or * with optional ?)
-    (?:[^()]*         # more group contents
-       |\[.*?\]       # or character classes
-    )*
-    \)               # closing group
-    [+*]\??          # outer quantifier (+ or * with optional ?)
-    """,
-    re.VERBOSE,
-)
-
-
 # Timing probe: catastrophic backtracking grows exponentially with input
 # length, so it shows up as a blowup across a short ladder of adversarial
 # inputs long before any single match becomes slow. Probing bails the moment
@@ -274,8 +257,8 @@ def _check_regex_safety(pattern: str) -> str | None:
     """Check a regex pattern for common ReDoS indicators.
 
     This is a structural check only; see _probe_regex_blowup for the empirical
-    one. Escaped characters are stripped first, since a literal '\\(' is not
-    grouping syntax and cannot nest a quantifier.
+    one. The scanner is linear and skips escaped characters and character
+    classes, where metacharacters are literals rather than quantifiers.
 
     Args:
         pattern: The raw regex source.
@@ -284,12 +267,44 @@ def _check_regex_safety(pattern: str) -> str | None:
         An error message if the pattern looks dangerous, or None if it appears
         safe by this check.
     """
-    unescaped = re.sub(r"\\.", "", pattern, flags=re.DOTALL)
-    if _REDOS_PATTERN.search(unescaped):
-        return (
-            "pattern contains nested quantifiers which can cause catastrophic "
-            "backtracking (ReDoS)"
-        )
+    group_repetitions: list[bool] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == "[":
+            index += 1
+            if index < len(pattern) and pattern[index] == "^":
+                index += 1
+            if index < len(pattern) and pattern[index] == "]":
+                index += 1
+            while index < len(pattern):
+                if pattern[index] == "\\":
+                    index += 2
+                elif pattern[index] == "]":
+                    index += 1
+                    break
+                else:
+                    index += 1
+            continue
+        if char == "(":
+            group_repetitions.append(False)
+        elif char == ")" and group_repetitions:
+            contains_repetition = group_repetitions.pop()
+            is_repeated = index + 1 < len(pattern) and pattern[index + 1] in "+*"
+            if contains_repetition and is_repeated:
+                return (
+                    "pattern contains nested quantifiers which can cause catastrophic "
+                    "backtracking (ReDoS)"
+                )
+            if group_repetitions:
+                group_repetitions[-1] |= contains_repetition or is_repeated
+        elif char in "+*" and group_repetitions:
+            group_repetitions[-1] = True
+        index += 1
+
     return None
 
 
@@ -421,12 +436,11 @@ _STOP_CHECK_INTERVAL = 10_000  # words between should_stop() polls
 
 @contextlib.contextmanager
 def _interrupt_guard() -> Iterator[Callable[[], bool]]:
-    """Install a flag-setting SIGINT handler for the duration of the block.
+    """Install an immediate, observable SIGINT handler for the block.
 
-    Yields a predicate reporting whether an interrupt has arrived. Replacing the
-    default handler disarms KeyboardInterrupt, so *every* unbounded loop in the
-    run has to poll this predicate. Miss one and Ctrl-C is not merely late, it
-    is ignored outright.
+    The handler raises immediately so a single long-running candidate operation,
+    such as an unsafe backtracking regex, remains interruptible. It also records
+    the signal for explicit polls at operation boundaries.
 
     Signal handlers can only be installed on the main thread. Off it, the block
     runs under default KeyboardInterrupt behaviour and the predicate stays
@@ -437,6 +451,7 @@ def _interrupt_guard() -> Iterator[Callable[[], bool]]:
     def handle(sig: int, frame: object) -> None:
         nonlocal interrupted
         interrupted = True
+        raise KeyboardInterrupt
 
     try:
         old_handler = signal.signal(signal.SIGINT, handle)
@@ -590,9 +605,6 @@ def _remove_if_exists(path: str) -> None:
 
 _FORCE_THRESHOLD = 10_000_000  # combinations above which --force is required
 _BLOOM_MAX_BYTES = 1 << 31  # 2 GiB ceiling on the approximate-dedup filter
-# How far the achievable false-positive rate may exceed the requested one before
-# the run is refused rather than quietly discarding valid words.
-_BLOOM_RATE_TOLERANCE = 10.0
 
 
 class _BloomSizing(NamedTuple):
@@ -625,9 +637,30 @@ def _plan_bloom(capacity: int, error_rate: float, max_bytes: int) -> _BloomSizin
         worse than requested whenever the ceiling binds.
     """
     capacity = max(1, capacity)
-    ideal_bits = math.ceil(-capacity * math.log(error_rate) / (math.log(2) ** 2))
+    # The familiar continuous Bloom formula can undersize by a small amount
+    # once the number of probes is rounded to an integer. Solve the formula for
+    # the two neighbouring integer probe counts so an uncapped plan actually
+    # honours the requested upper bound.
+    ideal_probes = max(1.0, -math.log2(error_rate))
+    probe_candidates = {max(1, math.floor(ideal_probes)), math.ceil(ideal_probes)}
+    candidates = [
+        (
+            math.ceil(
+                -probe_count
+                * capacity
+                / math.log1p(-(error_rate ** (1.0 / probe_count)))
+            ),
+            probe_count,
+        )
+        for probe_count in probe_candidates
+    ]
+    ideal_bits, ideal_hash_count = min(candidates)
     bits = max(8, min(ideal_bits, max_bytes * 8))
-    hash_count = max(1, round(bits / capacity * math.log(2)))
+    hash_count = (
+        ideal_hash_count
+        if bits >= ideal_bits
+        else max(1, round(bits / capacity * math.log(2)))
+    )
     achieved = float((1.0 - math.exp(-hash_count * capacity / bits)) ** hash_count)
     return _BloomSizing(bits, hash_count, achieved)
 
@@ -1076,15 +1109,16 @@ def _dedup_stage(words: Iterator[str], cfg: _RunConfig) -> Iterator[str]:
         # discards most of the wordlist without any signal that it did. Refuse
         # that instead of honouring --dedup-approx in name only.
         plan = _plan_bloom(cfg.dedup_capacity, cfg.dedup_error, _BLOOM_MAX_BYTES)
-        if plan.error_rate > cfg.dedup_error * _BLOOM_RATE_TOLERANCE:
+        if plan.error_rate > cfg.dedup_error:
             remedies = []
             # Only worth suggesting when the parser would accept it (< 1) and
             # it would actually clear this check. Once the ceiling binds hard
             # the rate pins at 1 and no --dedup-error value rescues the run --
             # only shrinking the input does.
             if plan.error_rate < 1.0:
+                acceptable_rate = math.nextafter(plan.error_rate, 1.0)
                 remedies.append(
-                    f"pass --dedup-error {plan.error_rate:.2g} to accept that rate"
+                    f"pass --dedup-error {acceptable_rate:.17g} to accept that rate"
                 )
             remedies.append("reduce the work with --limit or a narrower pattern")
             remedies.append("use --no-dedup to stream without dropping anything")

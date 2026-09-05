@@ -170,6 +170,18 @@ class TestCheckRegexSafety:
             assert result is not None, f"should be rejected: {pat}"
             assert "nested quantifiers" in result
 
+    @pytest.mark.parametrize("pattern", [r"(a\+)+", r"(\*)+", r"([+])+", r"([]+])+"])
+    def test_literal_quantifier_characters_are_allowed(self, pattern: str) -> None:
+        """Escaped and character-class metacharacters are not repetitions."""
+        assert _check_regex_safety(pattern) is None
+
+    def test_structural_check_is_linear_on_malformed_class(self) -> None:
+        """Malformed input must reach re.compile without detector backtracking."""
+        pattern = "(" + "[" * 24 + "a)+"
+        start = time.perf_counter()
+        assert _check_regex_safety(pattern) is None
+        assert time.perf_counter() - start < 0.05
+
     def test_cli_rejects_redos_pattern(self, capsys: pytest.CaptureFixture[str]) -> None:
         ret = main(["-p", "a*", "--charset", "ab", "--filter", "(a+)+$"])
         assert ret == 1
@@ -419,6 +431,15 @@ class TestInterruptCleanup:
         total = _chunked_write(["a", "b", "c"], buf, chunk_size=2, should_stop=None)
         assert total == 3
         assert buf.getvalue() == "a\nb\nc\n"
+
+    def test_sigint_handler_interrupts_current_operation(self) -> None:
+        """SIGINT must raise without waiting for the next candidate poll."""
+        with bitbrew._interrupt_guard() as should_stop:
+            handler = signal.getsignal(signal.SIGINT)
+            assert callable(handler)
+            with pytest.raises(KeyboardInterrupt):
+                handler(signal.SIGINT, None)
+            assert should_stop()
 
     def test_real_sigint_stops_generation_and_removes_partial(
         self, tmp_path: "os.PathLike[str]"
@@ -1302,6 +1323,19 @@ class TestBloomFilter:
         err = capsys.readouterr().err
         assert "approximate deduplication" in err
         assert "--no-dedup" in err, "the error must name a way forward"
+
+    def test_run_is_refused_for_any_worse_rate(self) -> None:
+        """The memory cap may not silently spend a multiple of the requested rate."""
+        requested = 1e-6
+        capacity = 700_000_000
+        plan = _plan_bloom(capacity, requested, _BLOOM_MAX_BYTES)
+        assert requested < plan.error_rate < requested * 10
+
+        cfg = types.SimpleNamespace(
+            dedup="approx", dedup_capacity=capacity, dedup_error=requested
+        )
+        with pytest.raises(bitbrew._CliError, match="best rate"):
+            bitbrew._dedup_stage(iter(()), cfg)
 
     def test_refusal_omits_dedup_error_advice_when_useless(
         self, capsys: pytest.CaptureFixture[str]
