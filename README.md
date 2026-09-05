@@ -325,6 +325,10 @@ much it had finished, and the non-zero exit code tells you it is a prefix, not t
 only once the run completes. An interrupted or failed run — a full disk, a permissions
 error — leaves no truncated wordlist at your output path.
 
+Placement is create-only unless you pass `--overwrite`, so a file that appears at your output
+path *while the run is going* is refused rather than clobbered. On a long run that window is
+hours wide; the check at startup is only a courtesy fast-fail.
+
 ---
 
 ### Safety flags
@@ -332,7 +336,7 @@ error — leaves no truncated wordlist at your output path.
 | Flag | Purpose |
 |------|---------|
 | `--force` | Required when estimated output exceeds 10 M words |
-| `--overwrite` | Required to overwrite an existing output file |
+| `--overwrite` | Required to overwrite an existing output file, whether it was there at startup or appeared mid-run |
 
 ---
 

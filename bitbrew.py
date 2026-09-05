@@ -624,6 +624,51 @@ def _create_sidecar(output_path: str) -> tuple[int, str]:
     )
 
 
+# Link failures that mean "this filesystem has no hard links" rather than
+# "this link cannot be made": FAT and some network mounts report these.
+_NO_HARDLINK_ERRNOS = frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS})
+
+
+def _place_output(temp_path: str, output_path: str, overwrite: bool) -> None:
+    """Move a finished sidecar onto the output path.
+
+    With overwrite the replacement is unconditional. Without it the placement
+    must not clobber a file that appeared since the resolve-time guard ran, so
+    it creates the output as a hard link -- which fails atomically if the path
+    is taken -- and only then drops the sidecar. Sidecar and output share a
+    directory, hence a filesystem, so the link is always valid wherever links
+    exist at all.
+
+    Where they do not, the path is reserved with an exclusive create instead,
+    which refuses an existing file just as atomically. That is the weaker
+    option only in that a crash between the reservation and the rename leaves
+    an empty file behind.
+
+    Args:
+        temp_path: The finished sidecar file.
+        output_path: Where the output should end up.
+        overwrite: Whether replacing an existing file is allowed.
+
+    Raises:
+        FileExistsError: If overwrite is False and output_path already exists.
+        OSError: If the placement fails for any other reason.
+    """
+    if overwrite:
+        os.replace(temp_path, output_path)
+        return
+    try:
+        os.link(temp_path, output_path)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        if exc.errno not in _NO_HARDLINK_ERRNOS:
+            raise
+        os.close(os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
+        os.replace(temp_path, output_path)
+        return
+    os.remove(temp_path)
+
+
 def _remove_if_exists(path: str) -> None:
     """Delete a file, ignoring the case where it was never created.
 
@@ -822,6 +867,7 @@ class _RunConfig:
     chunk_size: int
     output_path: str | None
     use_compress: bool
+    overwrite: bool
     dedup: str  # "none", "exact" or "approx"
     dedup_error: float
     total_estimate: int
@@ -1107,6 +1153,9 @@ def _resolve_options(args: argparse.Namespace) -> _RunConfig:
         output_dir = os.path.dirname(output_path)
         if output_dir and not os.path.isdir(output_dir):
             raise _CliError(f"output directory '{output_dir}' does not exist.")
+        # A courtesy fast-fail only: a file appearing after this check is
+        # caught atomically at placement time, which is what actually
+        # protects existing data.
         if os.path.exists(output_path) and not args.overwrite:
             raise _CliError(
                 f"output file '{output_path}' already exists. "
@@ -1123,6 +1172,7 @@ def _resolve_options(args: argparse.Namespace) -> _RunConfig:
         chunk_size=args.chunk_size,
         output_path=output_path,
         use_compress=args.compress or bool(output_path and output_path.endswith(".gz")),
+        overwrite=args.overwrite,
         dedup=_resolve_dedup_option(args),
         dedup_error=args.dedup_error,
         total_estimate=total_estimate,
@@ -1289,13 +1339,24 @@ def _write_to_file(
         if should_stop():
             raise KeyboardInterrupt
 
-        os.replace(temp_path, output_path)
+        _place_output(temp_path, output_path, cfg.overwrite)
         print(f"Wrote {written:,} words to {output_path}", file=sys.stderr)
     except KeyboardInterrupt:
         if temp_path is not None:
             _remove_if_exists(temp_path)
         print("\nInterrupted. Partial output file removed.", file=sys.stderr)
         return 130
+    except FileExistsError:
+        # The output appeared after the resolve-time guard: a concurrent run,
+        # or a file dropped in between. Refuse it the way the guard would have.
+        if temp_path is not None:
+            _remove_if_exists(temp_path)
+        print(
+            f"Error: output file '{output_path}' already exists. "
+            f"Use --overwrite to replace.",
+            file=sys.stderr,
+        )
+        return 1
     except OSError as exc:
         if temp_path is not None:
             _remove_if_exists(temp_path)

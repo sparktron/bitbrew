@@ -1788,3 +1788,142 @@ class TestSidecarCreation:
         with mock.patch("bitbrew.os.umask", side_effect=AssertionError("umask read")):
             handle, _ = bitbrew._create_sidecar(outfile)
         os.close(handle)
+
+
+class TestOverwriteRace:
+    """The overwrite guard must hold even against the TOCTOU window.
+
+    The resolve-time check can pass and then a file can appear before the
+    output is placed -- a gap of hours on a large run. Placement itself must
+    refuse to clobber it.
+    """
+
+    @staticmethod
+    def _resolve_then_plant(outfile: str, contents: str):
+        """Wrap _resolve_options so a file appears right after the guard runs."""
+        real_resolve = bitbrew._resolve_options
+
+        def wrapper(args: object) -> object:
+            cfg = real_resolve(args)  # the guard runs here and sees nothing
+            with open(outfile, "w", encoding="utf-8") as handle:
+                handle.write(contents)
+            return cfg
+
+        return wrapper
+
+    def test_file_appearing_after_guard_is_not_clobbered(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        plant = self._resolve_then_plant(outfile, "concurrent data")
+
+        with mock.patch("bitbrew._resolve_options", side_effect=plant):
+            ret = main(["-p", "a*", "--charset", "xy", "-o", outfile])
+
+        assert ret == 1
+        assert "already exists" in capsys.readouterr().err
+        with open(outfile, encoding="utf-8") as handle:
+            assert handle.read() == "concurrent data", "clobbered a file mid-run"
+        assert not _sidecars(tmp_path), "left a sidecar behind"
+
+    def test_overwrite_wins_the_race(self, tmp_path: "os.PathLike[str]") -> None:
+        """With --overwrite, a file appearing in the window is still replaced."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        plant = self._resolve_then_plant(outfile, "stale")
+
+        with mock.patch("bitbrew._resolve_options", side_effect=plant):
+            ret = main(["-p", "a*", "--charset", "xy", "-o", outfile, "--overwrite"])
+
+        assert ret == 0
+        with open(outfile, encoding="utf-8") as handle:
+            assert sorted(handle.read().split()) == ["ax", "ay"]
+        assert not _sidecars(tmp_path)
+
+
+class TestPlaceOutput:
+    """The placement primitive, including its no-hard-links fallback."""
+
+    @staticmethod
+    def _pair(tmp_path: "os.PathLike[str]", dst_contents: str | None = None):
+        src = os.path.join(str(tmp_path), "src.part")
+        dst = os.path.join(str(tmp_path), "dst.txt")
+        with open(src, "w", encoding="utf-8") as handle:
+            handle.write("payload")
+        if dst_contents is not None:
+            with open(dst, "w", encoding="utf-8") as handle:
+                handle.write(dst_contents)
+        return src, dst
+
+    def test_create_only_refuses_existing(self, tmp_path: "os.PathLike[str]") -> None:
+        src, dst = self._pair(tmp_path, "existing")
+        with pytest.raises(FileExistsError):
+            bitbrew._place_output(src, dst, overwrite=False)
+        with open(dst, encoding="utf-8") as handle:
+            assert handle.read() == "existing"
+
+    def test_create_only_delivers_when_absent(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        src, dst = self._pair(tmp_path)
+        bitbrew._place_output(src, dst, overwrite=False)
+        with open(dst, encoding="utf-8") as handle:
+            assert handle.read() == "payload"
+        assert not os.path.exists(src), "sidecar not removed after create-only place"
+
+    def test_overwrite_replaces(self, tmp_path: "os.PathLike[str]") -> None:
+        src, dst = self._pair(tmp_path, "existing")
+        bitbrew._place_output(src, dst, overwrite=True)
+        with open(dst, encoding="utf-8") as handle:
+            assert handle.read() == "payload"
+        assert not os.path.exists(src)
+
+    def test_fallback_refuses_existing_without_hard_links(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """On FAT and friends the reservation must refuse just as firmly."""
+        src, dst = self._pair(tmp_path, "existing")
+        no_links = OSError(errno.EPERM, "hard links not supported")
+        with (
+            mock.patch("bitbrew.os.link", side_effect=no_links),
+            pytest.raises(FileExistsError),
+        ):
+            bitbrew._place_output(src, dst, overwrite=False)
+        with open(dst, encoding="utf-8") as handle:
+            assert handle.read() == "existing"
+
+    def test_fallback_delivers_when_absent(self, tmp_path: "os.PathLike[str]") -> None:
+        """A filesystem without hard links must still get its output."""
+        src, dst = self._pair(tmp_path)
+        no_links = OSError(errno.EOPNOTSUPP, "hard links not supported")
+        with mock.patch("bitbrew.os.link", side_effect=no_links):
+            bitbrew._place_output(src, dst, overwrite=False)
+        with open(dst, encoding="utf-8") as handle:
+            assert handle.read() == "payload"
+        assert not os.path.exists(src)
+
+    def test_unrelated_link_error_is_not_swallowed(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """Only "no hard links here" earns the fallback; other errors surface."""
+        src, dst = self._pair(tmp_path)
+        with (
+            mock.patch(
+                "bitbrew.os.link", side_effect=OSError(errno.EXDEV, "cross-device link")
+            ),
+            pytest.raises(OSError) as excinfo,
+        ):
+            bitbrew._place_output(src, dst, overwrite=False)
+        assert excinfo.value.errno == errno.EXDEV
+        assert not os.path.exists(dst)
+
+    def test_write_path_survives_a_filesystem_without_hard_links(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """End to end: a full run completes where os.link is unavailable."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        no_links = OSError(errno.EPERM, "hard links not supported")
+        with mock.patch("bitbrew.os.link", side_effect=no_links):
+            assert main(["-p", "a*", "--charset", "xy", "-o", outfile]) == 0
+        with open(outfile, encoding="utf-8") as handle:
+            assert sorted(handle.read().split()) == ["ax", "ay"]
+        assert not _sidecars(tmp_path)
