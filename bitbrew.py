@@ -19,15 +19,16 @@ Usage as a library:
 import argparse
 import contextlib
 import dataclasses
+import errno
 import gzip
 import io
 import itertools
 import math
 import os
 import re
+import secrets
 import signal
 import sys
-import tempfile
 import time
 from collections.abc import Callable, Generator, Iterable, Iterator
 from typing import NamedTuple, Optional, Protocol
@@ -582,15 +583,45 @@ def _human_bytes(size: float) -> str:
     raise AssertionError("unreachable")
 
 
-def _current_umask() -> int:
-    """Read the process umask without leaving it changed.
+# How many random names to try before giving up on an unused sidecar path.
+_SIDECAR_ATTEMPTS = 100
+
+
+def _create_sidecar(output_path: str) -> tuple[int, str]:
+    """Create the exclusive temporary file the output is built in.
+
+    tempfile.mkstemp would do this, but it forces mode 0600, so the finished
+    file then has to be corrected to the mode a plain open() would have
+    produced. Computing that mode needs the umask, and reading the umask means
+    setting it -- os.umask(0) followed by a restore -- which widens permissions
+    process-wide for the length of the call. Any file a concurrent thread
+    creates in that window lands world-writable. Opening at 0666 and letting
+    the kernel subtract the umask reaches the same mode without ever making it
+    observable.
+
+    Args:
+        output_path: Where the finished file will be placed.
 
     Returns:
-        The umask currently in effect.
+        An open write-only file descriptor and the sidecar's path.
+
+    Raises:
+        OSError: If the file cannot be created, including exhausting the name
+            attempts.
     """
-    value = os.umask(0)
-    os.umask(value)
-    return value
+    directory = os.path.dirname(output_path) or "."
+    prefix = os.path.basename(output_path)
+    for _ in range(_SIDECAR_ATTEMPTS):
+        path = os.path.join(directory, f"{prefix}.{secrets.token_hex(8)}.part")
+        try:
+            handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            continue
+        return handle, path
+    raise OSError(
+        errno.EEXIST,
+        f"could not find an unused sidecar name next to '{output_path}'",
+    )
 
 
 def _remove_if_exists(path: str) -> None:
@@ -1236,11 +1267,7 @@ def _write_to_file(
     progress: _ProgressBar | None = None
     try:
         progress = _make_progress(cfg)
-        handle, temp_path = tempfile.mkstemp(
-            dir=os.path.dirname(output_path) or ".",
-            prefix=os.path.basename(output_path) + ".",
-            suffix=".part",
-        )
+        handle, temp_path = _create_sidecar(output_path)
         if cfg.use_compress:
             with (
                 os.fdopen(handle, "wb") as raw,
@@ -1262,9 +1289,6 @@ def _write_to_file(
         if should_stop():
             raise KeyboardInterrupt
 
-        # mkstemp creates 0600; give the finished file the mode a plain open()
-        # would have produced.
-        os.chmod(temp_path, 0o666 & ~_current_umask())
         os.replace(temp_path, output_path)
         print(f"Wrote {written:,} words to {output_path}", file=sys.stderr)
     except KeyboardInterrupt:
