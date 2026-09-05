@@ -9,3 +9,8 @@ words.txt
 
 # Sidecars from interrupted or crashed runs
 *.part
+
+# Coverage output
+.coverage
+coverage.xml
+htmlcov/

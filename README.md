@@ -413,6 +413,12 @@ ruff check .
 mypy
 ```
 
+Coverage is measured on every run and gated at 93%:
+
+```bash
+python -m pytest --cov=bitbrew --cov-report=term-missing
+```
+
 The test suite covers:
 - Charset resolution and deduplication
 - Pattern expansion (including edge cases with `?` and mixed wildcards)

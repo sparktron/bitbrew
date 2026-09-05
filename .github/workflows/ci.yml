@@ -5,6 +5,12 @@ on:
     branches: [master]
   pull_request:
 
+# Nothing here writes to the repository; checkout only needs to read it.
+# Without this the workflow inherits whatever the repository default is,
+# which for older repositories is a read-write GITHUB_TOKEN.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -27,6 +33,37 @@ jobs:
         run: |
           bitbrew -p "a*" --charset xy
           test "$(bitbrew -p '**' --charset ab --count)" = "4"
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package and test dependencies
+        run: pip install -e ".[dev,progress]"
+      # Coverage runs once rather than across the matrix: it roughly triples
+      # the suite's runtime, and the gaps it finds are not version-specific.
+      - name: Measure coverage
+        run: |
+          python -m pytest \
+            --cov=bitbrew --cov-report=term-missing --cov-report=xml \
+            --cov-fail-under=93
+      - name: Publish the report to the run summary
+        if: always()
+        run: |
+          {
+            echo '## Coverage'
+            echo '```'
+            python -m coverage report --show-missing
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-xml
+          path: coverage.xml
 
   lint:
     runs-on: ubuntu-latest
