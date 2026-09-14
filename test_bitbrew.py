@@ -1763,7 +1763,11 @@ class TestSidecarCreation:
             with pytest.raises(OSError) as excinfo:
                 bitbrew._create_sidecar(outfile)
 
-        assert excinfo.value.errno == errno.EEXIST
+        # Exhaustion reports no errno on purpose: errno.EEXIST would build a
+        # FileExistsError, which _write_to_file reads as "the output path is
+        # taken" and answers with a --overwrite hint that cannot help.
+        assert not isinstance(excinfo.value, FileExistsError)
+        assert "unused sidecar name" in str(excinfo.value)
         with open(path, encoding="utf-8") as existing:
             assert existing.read() == "irreplaceable"
 
@@ -2013,3 +2017,154 @@ class TestFallbackPublishesNothingEmpty:
         assert "Wrote" in capsys.readouterr().err
         with open(outfile, encoding="utf-8") as handle:
             assert sorted(handle.read().split()) == ["ax", "ay"]
+
+
+class TestStdoutBufferFlush:
+    """The last partial stdout buffer must be flushed inside the handlers.
+
+    stdout is block-buffered when it is not a terminal, so a short run's
+    output never reaches the descriptor until interpreter shutdown -- past
+    every handler in _write_to_stdout. Failures there used to escape as an
+    "Exception ignored" traceback and exit code 120, so the documented codes
+    only ever held for runs large enough to fill an 8 KiB buffer on the way.
+
+    These run real subprocesses: pytest's capture replaces sys.stdout with an
+    unbuffered object, which is precisely the condition that hides the bug.
+    """
+
+    @staticmethod
+    def _run(args: list[str], stdout: object) -> "subprocess.CompletedProcess[str]":
+        """Run bitbrew with stdout buffered as it would be under a redirect."""
+        env = dict(os.environ)
+        env.pop("PYTHONUNBUFFERED", None)
+        return subprocess.run(
+            [sys.executable, BITBREW_PY, *args],
+            stdout=stdout,  # type: ignore[arg-type]
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env=env,
+            check=False,
+        )
+
+    @pytest.mark.skipif(
+        not os.path.exists("/dev/full"), reason="needs /dev/full to fail a write"
+    )
+    @pytest.mark.parametrize("extra", [[], ["--compress"]])
+    def test_short_failed_write_reports_one_and_stays_quiet(
+        self, extra: list[str]
+    ) -> None:
+        """A two-word run onto a full device is exit 1, not a shutdown traceback."""
+        with open("/dev/full", "w") as full:
+            result = self._run(["-p", "a*", "--charset", "xy", *extra], full)
+
+        assert result.returncode == 1, result.stderr
+        assert "could not write to stdout" in result.stderr
+        assert "Exception ignored" not in result.stderr
+        assert "Traceback" not in result.stderr
+
+    def test_short_output_into_a_closed_pipe_is_silent(self) -> None:
+        """`| head` on a run too small to fill the buffer is still exit 0.
+
+        The existing broken-pipe test generates 11.8M words, which fills the
+        buffer long before the reader goes away; the failure then surfaces
+        inside the write loop. A short run only fails at shutdown.
+        """
+        env = dict(os.environ)
+        env.pop("PYTHONUNBUFFERED", None)
+        writer = subprocess.Popen(
+            [sys.executable, BITBREW_PY, "-p", "a*", "--charset", "xy"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        assert writer.stdout is not None
+        writer.stdout.close()
+        _, stderr = writer.communicate(timeout=60)
+
+        assert writer.returncode == 0
+        assert "Exception ignored" not in stderr
+        assert "BrokenPipeError" not in stderr
+
+
+class TestDetachStdout:
+    """Redirecting stdout to the null device must not leak the descriptor."""
+
+    def test_devnull_descriptor_is_closed(self) -> None:
+        """dup2 duplicates the description, so the opened end is surplus."""
+        opened: list[int] = []
+        closed: list[int] = []
+        real_open, real_close = os.open, os.close
+
+        def spy_open(path: str, flags: int, *rest: int) -> int:
+            fd = real_open(path, flags, *rest)
+            opened.append(fd)
+            return fd
+
+        with mock.patch.object(os, "open", spy_open), \
+             mock.patch.object(os, "close", lambda fd: (closed.append(fd), real_close(fd))), \
+             mock.patch.object(os, "dup2", lambda *a, **k: None):
+            bitbrew._detach_stdout()
+
+        assert opened, "expected the null device to be opened"
+        assert closed == opened
+
+    @pytest.mark.parametrize("stdout_factory", ["refuses", "missing"])
+    def test_descriptor_is_closed_without_a_usable_fileno(
+        self, stdout_factory: str
+    ) -> None:
+        """A stdout that cannot be detached must not leak, nor raise.
+
+        This runs on a path that is already reporting a failure, so an
+        AttributeError from a duck-typed stand-in with no fileno() at all
+        would land on top of the error the user actually needs to read.
+        """
+        closed: list[int] = []
+        real_close = os.close
+
+        class RefusesFileno:
+            def fileno(self) -> int:
+                raise io.UnsupportedOperation("no fileno")
+
+        class MissingFileno:
+            """A stdout stand-in with no fileno() attribute whatsoever."""
+
+        fake = RefusesFileno() if stdout_factory == "refuses" else MissingFileno()
+        with mock.patch.object(sys, "stdout", fake), \
+             mock.patch.object(os, "close", lambda fd: (closed.append(fd), real_close(fd))):
+            bitbrew._detach_stdout()
+
+        assert len(closed) == 1
+
+
+class TestSidecarExhaustion:
+    """Running out of sidecar names is not "the output path is taken"."""
+
+    def test_exhaustion_is_not_a_file_exists_error(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """OSError maps errno.EEXIST to FileExistsError, which misreads here."""
+        target = os.path.join(str(tmp_path), "out.txt")
+        with (
+            mock.patch("os.open", side_effect=FileExistsError()),
+            pytest.raises(OSError) as caught,
+        ):
+            bitbrew._create_sidecar(target)
+
+        assert not isinstance(caught.value, FileExistsError)
+        assert "unused sidecar name" in str(caught.value)
+
+    def test_cli_does_not_blame_the_output_path(
+        self, tmp_path: "os.PathLike[str]", capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--overwrite cannot help here, so the error must not suggest it."""
+        target = os.path.join(str(tmp_path), "out.txt")
+        with mock.patch(
+            "bitbrew._create_sidecar",
+            side_effect=OSError("could not find an unused sidecar name"),
+        ):
+            ret = main(["-p", "a*", "--charset", "xy", "-o", target])
+
+        assert ret == 1
+        stderr = capsys.readouterr().err
+        assert "unused sidecar name" in stderr
+        assert "already exists" not in stderr
+        assert "--overwrite" not in stderr

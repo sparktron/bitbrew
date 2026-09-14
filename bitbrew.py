@@ -607,7 +607,10 @@ def _create_sidecar(output_path: str) -> tuple[int, str]:
 
     Raises:
         OSError: If the file cannot be created, including exhausting the name
-            attempts.
+            attempts. The exhaustion error deliberately carries no errno:
+            OSError maps errno.EEXIST to FileExistsError, and the caller reads
+            that as "the output path is taken" and tells the user to pass
+            --overwrite, which would not help.
     """
     directory = os.path.dirname(output_path) or "."
     prefix = os.path.basename(output_path)
@@ -619,8 +622,8 @@ def _create_sidecar(output_path: str) -> tuple[int, str]:
             continue
         return handle, path
     raise OSError(
-        errno.EEXIST,
-        f"could not find an unused sidecar name next to '{output_path}'",
+        f"could not find an unused sidecar name next to '{output_path}' "
+        f"after {_SIDECAR_ATTEMPTS} attempts"
     )
 
 
@@ -1378,15 +1381,28 @@ def _write_to_file(
 
 
 def _detach_stdout() -> None:
-    """Point stdout at the null device after the reader has gone away.
+    """Point stdout at the null device once writing to it has failed.
 
-    Python flushes stdout again during interpreter shutdown; on a closed pipe
-    that raises a second BrokenPipeError and prints "Exception ignored" noise
-    after an otherwise ordinary `| head`.
+    A failed flush does not discard the buffer it could not write, and Python
+    flushes stdout once more during interpreter shutdown. That second attempt
+    runs outside every handler in this module, so it re-raises the same error
+    as "Exception ignored" noise and replaces the exit code with 120 --
+    silently, on a closed pipe; over the top of a reported error, on a failed
+    write. Redirecting the descriptor lets that last flush land in the void.
     """
-    with contextlib.suppress(OSError, ValueError):
+    # Best-effort cleanup on a path that is already failing: a stdout that
+    # cannot be detached (no fileno, or a closed one) must not raise over the
+    # error being reported. AttributeError covers a duck-typed stand-in with
+    # no fileno() at all; io.UnsupportedOperation is both OSError and
+    # ValueError, which covers the ones that have it but refuse to answer.
+    with contextlib.suppress(AttributeError, OSError, ValueError):
         devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, sys.stdout.fileno())
+        try:
+            os.dup2(devnull, sys.stdout.fileno())
+        finally:
+            # dup2 duplicates the description, so this end is surplus either
+            # way; closing it in a finally also covers a stdout with no fileno.
+            os.close(devnull)
 
 
 def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
@@ -1395,6 +1411,12 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
     Exit codes match the -o path: 130 when interrupted, 1 when the write
     fails. A closed downstream pipe is the one success case -- `| head`
     getting what it asked for is not an error.
+
+    Every path flushes before returning. stdout is block-buffered when it is
+    not a terminal, so without an explicit flush the last partial buffer is
+    written during interpreter shutdown, outside every handler here: a failure
+    there escapes as "Exception ignored" noise and exit code 120 instead of the
+    code this function promises.
 
     Args:
         words: The finished word stream.
@@ -1408,6 +1430,7 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
         try:
             for word in words:
                 print(word)
+            sys.stdout.flush()
         except BrokenPipeError:
             _detach_stdout()
             return 0
@@ -1416,6 +1439,7 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
             return 130
         except OSError as exc:
             print(f"Error: could not write to stdout: {exc}", file=sys.stderr)
+            _detach_stdout()
             return 1
         return 0
 
@@ -1437,6 +1461,7 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
     try:
         with gzip.GzipFile(fileobj=raw, mode="wb") as binary:
             _chunked_write(words, binary, cfg.chunk_size)
+        raw.flush()
     except BrokenPipeError:
         _detach_stdout()
         return 0
@@ -1451,6 +1476,7 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
         return 130
     except OSError as exc:
         print(f"Error: could not write to stdout: {exc}", file=sys.stderr)
+        _detach_stdout()
         return 1
     return 0
 
