@@ -103,13 +103,8 @@ def _dedupe_chars(chars: str) -> str:
     Returns:
         The deduplicated character string.
     """
-    seen: set[str] = set()
-    result = []
-    for char in chars:
-        if char not in seen:
-            seen.add(char)
-            result.append(char)
-    return "".join(result)
+    # dict preserves insertion order, so this is first-appearance order.
+    return "".join(dict.fromkeys(chars))
 
 
 def load_charset_file(path: str) -> str:
@@ -142,6 +137,29 @@ _DEDUP_WARN_THRESHOLD = 1_000_000  # warn above this when dedup is in play
 _BYTES_PER_WORD = 100  # measured cost of holding one short word in a set
 
 
+def _count_from_kinds(kinds: Iterable[str], charset_len: int) -> int:
+    """Count the words a parsed pattern's wildcards will produce.
+
+    Split out so callers that have already parsed a pattern -- option
+    resolution parses every one of them to validate it -- do not parse it a
+    second time just to size it.
+
+    Args:
+        kinds: Wildcard kinds, as returned by _parse_pattern.
+        charset_len: Number of characters in the active charset.
+
+    Returns:
+        Word count (capped at _MAX_ESTIMATE).
+    """
+    count = 1
+    for kind in kinds:
+        # "?" has one extra option: matching nothing at all.
+        count *= charset_len if kind == "*" else charset_len + 1
+        if count > _MAX_ESTIMATE:
+            return _MAX_ESTIMATE
+    return count
+
+
 def estimate_count(pattern: str, charset_len: int) -> int:
     """Estimate the total number of words a pattern will generate.
 
@@ -155,14 +173,7 @@ def estimate_count(pattern: str, charset_len: int) -> int:
     Raises:
         ValueError: If the pattern ends with a dangling backslash.
     """
-    _, kinds = _parse_pattern(pattern)
-    count = 1
-    for kind in kinds:
-        # "?" has one extra option: matching nothing at all.
-        count *= charset_len if kind == "*" else charset_len + 1
-        if count > _MAX_ESTIMATE:
-            return _MAX_ESTIMATE
-    return count
+    return _count_from_kinds(_parse_pattern(pattern)[1], charset_len)
 
 
 def generate_wordlist(pattern: str, charset: str = "lower") -> Generator[str, None, None]:
@@ -826,7 +837,13 @@ class _BloomFilter:
     judged already-seen and dropped, so this is never the default.
     """
 
-    def __init__(self, capacity: int, error_rate: float, max_bytes: int) -> None:
+    def __init__(
+        self,
+        capacity: int,
+        error_rate: float,
+        max_bytes: int,
+        plan: _BloomSizing | None = None,
+    ) -> None:
         """Size a filter for the expected number of items and allocate it.
 
         Args:
@@ -835,12 +852,18 @@ class _BloomFilter:
             max_bytes: Hard ceiling on memory; the achieved rate degrades if the
                 ideal size would exceed it. Callers that care should consult
                 _plan_bloom first -- see _dedup_stage.
+            plan: A sizing already computed for these arguments. Passing it back
+                keeps the filter that gets allocated identical to the one the
+                caller checked and reported, rather than a recomputation that
+                has to be trusted to agree.
 
         Raises:
             _CliError: If the bit array does not fit in available memory.
         """
         self.capacity = max(1, capacity)
-        self.plan = _plan_bloom(self.capacity, error_rate, max_bytes)
+        if plan is None:
+            plan = _plan_bloom(self.capacity, error_rate, max_bytes)
+        self.plan = plan
         self.bits = self.plan.bits
         self.hash_count = self.plan.hash_count
         try:
@@ -862,13 +885,16 @@ class _BloomFilter:
         """False-positive rate this filter actually achieves at capacity."""
         return self.plan.error_rate
 
-    def _positions(self, item: str) -> list[int]:
+    def _positions(self, item: str) -> Iterator[int]:
         """Derive this item's bit positions.
+
+        This is the definition of the probe scheme; add_if_absent inlines it
+        for speed, and a test holds the two to the same answers.
 
         Args:
             item: The word to hash.
 
-        Returns:
+        Yields:
             hash_count bit indices.
         """
         # Kirsch-Mitzenmacher: k probes derived from two hashes. hash() is
@@ -877,7 +903,8 @@ class _BloomFilter:
         # tracks theory.
         first = hash(item)
         second = hash(item + "\x00bitbrew") | 1
-        return [(first + probe * second) % self.bits for probe in range(self.hash_count)]
+        for probe in range(self.hash_count):
+            yield (first + probe * second) % self.bits
 
     def probably_contains(self, item: str) -> bool:
         """Query membership without recording the item.
@@ -903,13 +930,21 @@ class _BloomFilter:
             True if the item was probably absent, False if probably present.
             False may be wrong at the filter's error rate; True never is.
         """
+        # _positions inlined: this runs once per candidate word, and stepping
+        # the position by `second` each time is the same sequence as
+        # (first + probe * second) without the multiply or the generator
+        # resume. TestBloomProbeScheme holds the two forms to one answer.
         array = self._array
+        bits = self.bits
+        position = hash(item) % bits
+        second = hash(item + "\x00bitbrew") | 1
         seen = True
-        for position in self._positions(item):
+        for _ in range(self.hash_count):
             index, mask = position >> 3, 1 << (position & 7)
             if not array[index] & mask:
                 seen = False
                 array[index] |= mask
+            position = (position + second) % bits
         return not seen
 
 
@@ -1222,7 +1257,7 @@ def _resolve_options(args: argparse.Namespace) -> _RunConfig:
                 f"Warning: pattern '{pattern}' has no wildcards; emitting as literal.",
                 file=sys.stderr,
             )
-        total_estimate += estimate_count(pattern, len(charset))
+        total_estimate += _count_from_kinds(kinds, len(charset))
 
     output_path = args.output
     # --count prints to stdout and never opens the output path, so validating
@@ -1311,7 +1346,10 @@ def _dedup_stage(words: Iterator[str], cfg: _RunConfig) -> Iterator[str]:
             file=sys.stderr,
         )
         return _deduplicated_approx(
-            words, _BloomFilter(cfg.dedup_capacity, cfg.dedup_error, _BLOOM_MAX_BYTES)
+            words,
+            _BloomFilter(
+                cfg.dedup_capacity, cfg.dedup_error, _BLOOM_MAX_BYTES, plan=plan
+            ),
         )
     if cfg.total_estimate > _DEDUP_WARN_THRESHOLD:
         print(

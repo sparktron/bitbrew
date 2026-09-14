@@ -1073,13 +1073,21 @@ class TestProgressTotal:
         assert _FakeTqdm.last["total"] is None
 
     def test_saturated_estimate_gets_no_total(self, tmp_path: "os.PathLike[str]") -> None:
-        """A capped estimate is not a real number; show a counter instead."""
+        """A capped estimate is not a real number; show a counter instead.
+
+        The cap is reached for real rather than mocked: 70**16 combinations
+        saturate _MAX_ESTIMATE, and the estimate is arithmetic, so asking for
+        it costs nothing. _chunked_write is stubbed so the lazy pipeline is
+        never actually walked.
+        """
         out = os.path.join(str(tmp_path), "w.txt")
-        with (
-            mock.patch("bitbrew.estimate_count", return_value=_MAX_ESTIMATE),
-            mock.patch("bitbrew._chunked_write", return_value=0),
-        ):
-            assert main(["-p", "a*", "--charset", "xy", "-o", out, "--force"]) == 0
+        pattern = "*" * 16
+        with mock.patch("bitbrew._chunked_write", return_value=0):
+            assert main(
+                ["-p", pattern, "--charset", "all", "-o", out, "--force"]
+            ) == 0
+
+        assert estimate_count(pattern, len(resolve_charset("all"))) == _MAX_ESTIMATE
         assert _FakeTqdm.last["total"] is None
 
 
@@ -2367,3 +2375,45 @@ class TestFilterStageBypass:
             )
         )
         assert unfiltered == permissive == ["ax", "ay", "az"]
+
+
+class TestBloomProbeScheme:
+    """add_if_absent inlines _positions, so the two must not drift apart."""
+
+    def test_inlined_probe_walk_matches_the_definition(self) -> None:
+        """Stepping by `second` must reproduce (first + probe * second)."""
+        reference = _BloomFilter(5_000, 1e-3, _BLOOM_MAX_BYTES)
+        inlined = _BloomFilter(5_000, 1e-3, _BLOOM_MAX_BYTES)
+        assert reference.hash_count > 1, "a one-probe filter would not test this"
+
+        for word in (f"w{i}" for i in range(5_000)):
+            # Set the reference's bits straight from _positions.
+            expected_new = False
+            for position in reference._positions(word):
+                index, mask = position >> 3, 1 << (position & 7)
+                if not reference._array[index] & mask:
+                    expected_new = True
+                    reference._array[index] |= mask
+            assert inlined.add_if_absent(word) is expected_new
+
+        assert inlined._array == reference._array
+
+    def test_probably_contains_agrees_with_add_if_absent(self) -> None:
+        """The query path and the recording path share one probe scheme."""
+        bloom = _BloomFilter(2_000, 1e-3, _BLOOM_MAX_BYTES)
+        added = [f"added{i}" for i in range(2_000)]
+        for word in added:
+            bloom.add_if_absent(word)
+
+        assert all(bloom.probably_contains(word) for word in added)
+        assert not bloom.add_if_absent(added[0])
+
+    def test_allocated_filter_uses_the_plan_that_was_reported(self) -> None:
+        """The cost printed before allocating must be the cost allocated."""
+        plan = _plan_bloom(10_000, 1e-4, _BLOOM_MAX_BYTES)
+        bloom = _BloomFilter(10_000, 1e-4, _BLOOM_MAX_BYTES, plan=plan)
+
+        assert bloom.plan is plan
+        assert bloom.size_bytes == plan.size_bytes
+        assert bloom.hash_count == plan.hash_count
+        assert bloom.expected_error_rate == plan.error_rate
