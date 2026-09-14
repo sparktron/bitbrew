@@ -2417,3 +2417,41 @@ class TestBloomProbeScheme:
         assert bloom.size_bytes == plan.size_bytes
         assert bloom.hash_count == plan.hash_count
         assert bloom.expected_error_rate == plan.error_rate
+
+
+class TestStdoutTerminalDetection:
+    """A replaced stdout need not answer isatty(); that must not fail a run."""
+
+    @pytest.mark.parametrize("broken", [AttributeError, ValueError, OSError])
+    def test_unanswerable_stdout_is_treated_as_not_a_terminal(
+        self, broken: type[BaseException]
+    ) -> None:
+        """Chunking the stream and allowing binary are the safe fallbacks."""
+
+        class Unanswerable:
+            def isatty(self) -> bool:
+                raise broken("no")
+
+        with mock.patch.object(sys, "stdout", Unanswerable()):
+            assert bitbrew._stdout_is_terminal() is False
+
+    def test_stdout_without_isatty_still_writes(self) -> None:
+        """A minimal stand-in with only write() must still work end to end."""
+
+        class Minimal:
+            def __init__(self) -> None:
+                self.data = ""
+
+            def write(self, data: str) -> int:
+                self.data += data
+                return len(data)
+
+            def flush(self) -> None:
+                pass
+
+        fake = Minimal()
+        with mock.patch.object(sys, "stdout", fake):
+            ret = main(["-p", "a*", "--charset", "xy"])
+
+        assert ret == 0
+        assert fake.data == "ax\nay\n"

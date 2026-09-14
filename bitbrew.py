@@ -1518,6 +1518,22 @@ def _detach_stdout() -> None:
             os.close(devnull)
 
 
+def _stdout_is_terminal() -> bool:
+    """Report whether stdout is a terminal, treating "cannot tell" as no.
+
+    A replaced stdout need not implement isatty(), and not being able to ask is
+    no reason to fail a run that is about to write plain text. Both callers
+    want the same fallback: chunk the stream, and allow binary output.
+
+    Returns:
+        True only when stdout is known to be a terminal.
+    """
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
     """Stream words to stdout, gzipped when asked.
 
@@ -1544,7 +1560,7 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
         # output while reaching only the -o and --compress paths. At a terminal
         # a person is reading along, so latency beats throughput and the chunk
         # drops to a single line; a redirect or a pipe gets the full chunk.
-        chunk_size = 1 if sys.stdout.isatty() else cfg.chunk_size
+        chunk_size = 1 if _stdout_is_terminal() else cfg.chunk_size
         # BrokenPipeError subclasses OSError, so it has to be caught first.
         try:
             _chunked_write(words, sys.stdout, chunk_size)
@@ -1562,7 +1578,7 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
         return 0
 
     # Gzip to stdout, but never at a terminal -- binary down a TTY is noise.
-    if sys.stdout.isatty():
+    if _stdout_is_terminal():
         print(
             "Error: refusing to write compressed output to a terminal. "
             "Redirect it, pipe it, or use -o.",
