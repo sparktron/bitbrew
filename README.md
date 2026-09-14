@@ -169,7 +169,10 @@ catastrophically turns a short run into an unbounded hang. bitbrew screens each 
 two ways before generating anything:
 
 1. **Structural check** — linearly scans for nested quantifiers such as `(a+)+` or
-   `(\d+)+`, while treating escapes and character-class contents as literals.
+   `(\d+)+`, while treating escapes and character-class contents as literals. A
+   repetition written as a range brace counts on either side of the nesting, so
+   `(a{1,3})+` and `(a+){2,}` are caught too. A fixed count is not a range and is left
+   alone: `(a{3})+` has no alternative lengths to backtrack over.
 2. **Timing probe** — matches the regex against a short ladder of adversarial inputs built
    from the pattern's own alphabet and rejects it if the time grows exponentially. This
    catches the overlapping-alternation family, like `(a|a)+$` and `(a|b|ab)*$`, that no
@@ -298,11 +301,16 @@ Check the size before you commit to it — `--count` and the `--force` warning b
 what you are about to generate. Each extra `*` multiplies the output by the charset size:
 `-p "******"` over `lower` is 308 million words and roughly 2 GB of text.
 
-Control the streaming buffer size with `--chunk-size` (default: 10,000 words):
+Control the streaming buffer size with `--chunk-size` (default: 10,000 words). It applies
+to every destination — a file, gzip, or stdout:
 
 ```bash
 bitbrew -p "*****" --charset lower --force -o big.txt --chunk-size 50000
 ```
+
+Streaming to a **terminal** ignores the chunk size and writes one line at a time, so output
+appears as it is generated rather than in bursts. Redirect or pipe the stream and the full
+chunk applies.
 
 **Optional progress bar** — install `tqdm` and bitbrew will display a live progress counter automatically when writing to a file:
 
