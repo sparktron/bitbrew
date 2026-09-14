@@ -254,12 +254,53 @@ _PROBE_BUDGET = 0.05  # seconds of cumulative match time before we call it unsaf
 _PROBE_MAX_SEEDS = 4
 
 
+# A brace quantifier spanning a range. "{3}" is deliberately not matched: a
+# fixed count leaves the engine no alternative lengths to backtrack over.
+_BRACE_QUANTIFIER = re.compile(r"\{(\d*),(\d*)\}")
+
+
+def _is_variable_repetition(pattern: str, index: int) -> bool:
+    """Report whether a repetition of more than one length starts at index.
+
+    "*" and "+" always are. A brace quantifier is one only when it spans a
+    range: "a{2,5}" and "a{2,}" leave the engine a choice it can backtrack
+    over, while "a{3}" is a fixed count with nothing to reconsider.
+
+    Args:
+        pattern: The raw regex source.
+        index: Position to test.
+
+    Returns:
+        True if a variable-length repetition starts at index.
+    """
+    if index >= len(pattern):
+        return False
+    char = pattern[index]
+    if char in "+*":
+        return True
+    if char != "{":
+        return False
+    match = _BRACE_QUANTIFIER.match(pattern, index)
+    if match is None:
+        return False
+    low, high = match.group(1), match.group(2)
+    if not low and not high:
+        # Python reads a bare "{,}" as three literal characters.
+        return False
+    return not high or int(high) > int(low or 0)
+
+
 def _check_regex_safety(pattern: str) -> str | None:
     """Check a regex pattern for common ReDoS indicators.
 
     This is a structural check only; see _probe_regex_blowup for the empirical
     one. The scanner is linear and skips escaped characters and character
     classes, where metacharacters are literals rather than quantifiers.
+
+    Repetition means "*", "+", or a brace quantifier spanning a range, on
+    either side of the nesting: "(a{1,3})+" and "(a+){2,}" backtrack just as
+    badly as "(a+)+". Missing those left them to the timing probe, which
+    charges a hundred milliseconds to reach a vaguer answer.
 
     Args:
         pattern: The raw regex source.
@@ -294,7 +335,7 @@ def _check_regex_safety(pattern: str) -> str | None:
             group_repetitions.append(False)
         elif char == ")" and group_repetitions:
             contains_repetition = group_repetitions.pop()
-            is_repeated = index + 1 < len(pattern) and pattern[index + 1] in "+*"
+            is_repeated = _is_variable_repetition(pattern, index + 1)
             if contains_repetition and is_repeated:
                 return (
                     "pattern contains nested quantifiers which can cause catastrophic "
@@ -302,7 +343,7 @@ def _check_regex_safety(pattern: str) -> str | None:
                 )
             if group_repetitions:
                 group_repetitions[-1] |= contains_repetition or is_repeated
-        elif char in "+*" and group_repetitions:
+        elif group_repetitions and _is_variable_repetition(pattern, index):
             group_repetitions[-1] = True
         index += 1
 

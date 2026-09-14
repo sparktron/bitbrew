@@ -174,6 +174,34 @@ class TestCheckRegexSafety:
         """Escaped and character-class metacharacters are not repetitions."""
         assert _check_regex_safety(pattern) is None
 
+    @pytest.mark.parametrize(
+        "pattern",
+        [r"(a{1,3})+$", r"(a{2,})+$", r"(a+){2,}$", r"([a-z]{2,3})+$", r"(a{1,2}){3,}"],
+    )
+    def test_range_brace_quantifiers_are_repetitions(self, pattern: str) -> None:
+        """A range brace backtracks like "*", on either side of the nesting.
+
+        These used to pass the structural check and fall through to the timing
+        probe, which spends ~100 ms per pattern to reach a vaguer verdict.
+        """
+        result = _check_regex_safety(pattern)
+        assert result is not None, f"should be rejected: {pattern}"
+        assert "nested quantifiers" in result
+
+    @pytest.mark.parametrize("pattern", [r"(a{3})+", r"(\d{4})+", r"(a{,})+", r"(a{})+"])
+    def test_fixed_and_literal_braces_are_not_repetitions(self, pattern: str) -> None:
+        """A fixed count has no alternative lengths, so it cannot blow up.
+
+        "{,}" and "{}" are literal characters to Python's engine, not
+        quantifiers at all. Rejecting these would be a false positive.
+        """
+        assert _check_regex_safety(pattern) is None
+
+    def test_brace_screening_agrees_with_the_timing_probe(self) -> None:
+        """The structural verdict must match what matching actually does."""
+        assert _probe_regex_blowup(re.compile(r"(a{1,3})+$"), r"(a{1,3})+$") is not None
+        assert _probe_regex_blowup(re.compile(r"(a{3})+$"), r"(a{3})+$") is None
+
     def test_structural_check_is_linear_on_malformed_class(self) -> None:
         """Malformed input must reach re.compile without detector backtracking."""
         pattern = "(" + "[" * 24 + "a)+"
