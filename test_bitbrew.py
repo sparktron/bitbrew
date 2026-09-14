@@ -4,6 +4,7 @@ import errno
 import gzip
 import importlib.metadata
 import io
+import itertools
 import os
 import re
 import shutil
@@ -1151,6 +1152,49 @@ class TestPatternEscapes:
         ret = main(["-p", r"\*\?", "--charset", "xy"])
         assert ret == 0
         assert "no wildcards" in capsys.readouterr().err
+
+
+class TestParsePatternShape:
+    """_parse_pattern's literal runs line up one-to-one with the wildcards."""
+
+    @pytest.mark.parametrize(
+        ("pattern", "literals", "kinds"),
+        [
+            ("hello", ["hello"], []),
+            ("", [""], []),
+            ("*", ["", ""], ["*"]),
+            ("a*b", ["a", "b"], ["*"]),
+            ("**", ["", "", ""], ["*", "*"]),
+            ("a*b?c", ["a", "b", "c"], ["*", "?"]),
+            ("*ab*", ["", "ab", ""], ["*", "*"]),
+            (r"a\*b*", ["a*b", ""], ["*"]),
+        ],
+    )
+    def test_literals_have_one_more_entry_than_kinds(
+        self, pattern: str, literals: list[str], kinds: list[str]
+    ) -> None:
+        """Empty runs are kept so literals[i] always precedes wildcard i."""
+        assert _parse_pattern(pattern) == (literals, kinds)
+
+    @pytest.mark.parametrize(
+        "pattern", ["hello", "*", "a*b", "**", "a*b?c", "*ab*", "?", "??x"]
+    )
+    def test_reassembly_matches_expansion(self, pattern: str) -> None:
+        """literals[0] + choice[0] + ... must rebuild every generated word."""
+        literals, kinds = _parse_pattern(pattern)
+        assert len(literals) == len(kinds) + 1
+
+        chars = "ab"
+        options = [list(chars) if k == "*" else ["", *chars] for k in kinds]
+        expected = [
+            "".join(
+                part
+                for pair in zip(literals, [*combo, ""], strict=True)
+                for part in pair
+            )
+            for combo in itertools.product(*options)
+        ]
+        assert list(_expand_pattern(pattern, chars)) == expected
 
 
 class TestCharsetFile:
