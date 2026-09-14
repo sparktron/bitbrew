@@ -21,7 +21,6 @@ import contextlib
 import dataclasses
 import errno
 import gzip
-import io
 import itertools
 import math
 import os
@@ -44,6 +43,17 @@ class _ProgressBar(Protocol):
 
     def close(self) -> None:
         """Finalise the bar. Must tolerate being called twice."""
+
+
+class _TextSink(Protocol):
+    """The slice of a text file object the writer uses.
+
+    Naming the one method needed lets the writer target a real file, sys.stdout
+    and an in-memory buffer alike without enumerating concrete classes.
+    """
+
+    def write(self, data: str, /) -> int:
+        """Write a string, returning the number of characters written."""
 
 
 class _CliError(Exception):
@@ -456,9 +466,7 @@ def _deduplicated(words: Iterable[str]) -> Generator[str, None, None]:
             yield word
 
 
-def _text_writer(
-    file_obj: "gzip.GzipFile | io.TextIOBase | io.StringIO",
-) -> Callable[[str], None]:
+def _text_writer(file_obj: "gzip.GzipFile | _TextSink") -> Callable[[str], None]:
     """Adapt a text-mode or binary-gzip destination to one str-writing call.
 
     Resolving the text/binary question once, here, keeps it out of the write
@@ -537,62 +545,67 @@ def _interruptible(
     Raises:
         KeyboardInterrupt: When should_stop() returns True.
     """
-    for seen, word in enumerate(words, 1):
-        if seen % _STOP_CHECK_INTERVAL == 0 and should_stop():
-            raise KeyboardInterrupt
+    # A countdown rather than enumerate() plus a modulo: this runs once per
+    # candidate over a space that can reach billions, and the running total
+    # grows out of machine-word range while the countdown never does.
+    countdown = _STOP_CHECK_INTERVAL
+    for word in words:
+        countdown -= 1
+        if not countdown:
+            countdown = _STOP_CHECK_INTERVAL
+            if should_stop():
+                raise KeyboardInterrupt
         yield word
 
 
 def _chunked_write(
     words: Iterable[str],
-    file_obj: "gzip.GzipFile | io.TextIOBase | io.StringIO",
+    file_obj: "gzip.GzipFile | _TextSink",
     chunk_size: int,
     progress: _ProgressBar | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> int:
     """Write words to a file in chunks.
 
+    Collecting each chunk with itertools.islice keeps the per-word work in C:
+    appending and counting in Python cost roughly three times as much, and this
+    loop sees every word the run emits.
+
     Args:
         words: Word iterable.
         file_obj: File object to write to (text-mode or binary gzip).
         chunk_size: Number of words per chunk.
         progress: Optional tqdm progress bar to update.
-        should_stop: Optional predicate polled every _STOP_CHECK_INTERVAL words
-            (or every chunk, whichever is smaller). When it returns True the
-            write is abandoned.
+        should_stop: Optional predicate polled once per chunk. When it returns
+            True the write is abandoned. While it is installed, chunks are
+            capped at _STOP_CHECK_INTERVAL words so a large --chunk-size cannot
+            stretch the gap between polls; that only splits the write calls,
+            which the destination buffers back together anyway.
 
     Returns:
         Total number of words written.
 
     Raises:
-        KeyboardInterrupt: If should_stop() returns True mid-write.
+        KeyboardInterrupt: If should_stop() returns True between chunks.
     """
     write = _text_writer(file_obj)
+    stream = iter(words)
+    block = chunk_size if should_stop is None else min(chunk_size, _STOP_CHECK_INTERVAL)
     total = 0
-    buf: list[str] = []
-
-    def flush() -> None:
-        nonlocal total
-        write("\n".join(buf) + "\n")
+    while True:
+        chunk = list(itertools.islice(stream, block))
+        if not chunk:
+            return total
+        count = len(chunk)
+        # A trailing "" ends the joined block with a newline. Appending one
+        # instead would copy a string the size of the whole chunk.
+        chunk.append("")
+        write("\n".join(chunk))
         if progress is not None:
-            progress.update(len(buf))
-        total += len(buf)
-        buf.clear()
-
-    check_every = min(chunk_size, _STOP_CHECK_INTERVAL)
-    since_check = 0
-    for word in words:
-        buf.append(word)
-        if len(buf) >= chunk_size:
-            flush()
-        since_check += 1
-        if since_check >= check_every:
-            since_check = 0
-            if should_stop is not None and should_stop():
-                raise KeyboardInterrupt
-    if buf:
-        flush()
-    return total
+            progress.update(count)
+        total += count
+        if should_stop is not None and should_stop():
+            raise KeyboardInterrupt
 
 
 def _needs_dedup(patterns: list[str]) -> bool:
@@ -937,6 +950,19 @@ class _RunConfig:
     count_only: bool
 
     @property
+    def has_filters(self) -> bool:
+        """Whether any length bound or regex filter is configured.
+
+        Returns:
+            True if the filter stage would reject anything.
+        """
+        return (
+            self.min_len is not None
+            or self.max_len is not None
+            or self.regex is not None
+        )
+
+    @property
     def discards_candidates(self) -> bool:
         """Whether a stage between generation and output can drop candidates.
 
@@ -946,12 +972,7 @@ class _RunConfig:
         Returns:
             True if filtering or deduplication sits in the pipeline.
         """
-        return (
-            self.min_len is not None
-            or self.max_len is not None
-            or self.regex is not None
-            or self.dedup != "none"
-        )
+        return self.has_filters or self.dedup != "none"
 
     @property
     def effective_scale(self) -> int:
@@ -1319,7 +1340,7 @@ def _build_pipeline(
         for pattern in cfg.patterns:
             yield from _expand_pattern(pattern, cfg.charset)
 
-    source: Iterable[str] = expand()
+    source: Iterator[str] = expand()
     if should_stop is not None:
         source = _interruptible(source, should_stop)
 
@@ -1327,9 +1348,12 @@ def _build_pipeline(
     # the output is identical either way, but this keeps rejected candidates
     # out of the dedup set entirely -- its memory then tracks the output rather
     # than the whole pattern space, which is the tool's real scaling limit.
-    words = _dedup_stage(
-        _apply_filters(source, cfg.min_len, cfg.max_len, cfg.regex), cfg
-    )
+    #
+    # An unconfigured filter stage is not free: it is a generator resumed once
+    # per word, for three comparisons that can never reject one. Leave it out.
+    if cfg.has_filters:
+        source = _apply_filters(source, cfg.min_len, cfg.max_len, cfg.regex)
+    words = _dedup_stage(source, cfg)
     if cfg.limit is not None:
         return itertools.islice(words, cfg.limit)
     return words
@@ -1477,10 +1501,15 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
         Process exit code.
     """
     if not cfg.use_compress:
+        # print() per word costs about three times a joined write per chunk,
+        # and --chunk-size has always advertised itself as governing streaming
+        # output while reaching only the -o and --compress paths. At a terminal
+        # a person is reading along, so latency beats throughput and the chunk
+        # drops to a single line; a redirect or a pipe gets the full chunk.
+        chunk_size = 1 if sys.stdout.isatty() else cfg.chunk_size
         # BrokenPipeError subclasses OSError, so it has to be caught first.
         try:
-            for word in words:
-                print(word)
+            _chunked_write(words, sys.stdout, chunk_size)
             sys.stdout.flush()
         except BrokenPipeError:
             _detach_stdout()

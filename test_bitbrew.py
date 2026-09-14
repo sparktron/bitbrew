@@ -2240,3 +2240,130 @@ class TestSidecarExhaustion:
         assert "unused sidecar name" in stderr
         assert "already exists" not in stderr
         assert "--overwrite" not in stderr
+
+
+class _RecordingStdout:
+    """A non-tty stdout stand-in that records each write call."""
+
+    def __init__(self, tty: bool = False) -> None:
+        self.writes: list[str] = []
+        self._tty = tty
+
+    def write(self, data: str) -> int:
+        self.writes.append(data)
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+class TestStdoutChunking:
+    """--chunk-size governs the stdout stream, as its help text says.
+
+    It previously reached only the -o and --compress paths; plain stdout
+    wrote one print() per word regardless.
+    """
+
+    def test_chunk_size_governs_stdout_writes(self) -> None:
+        """25 words at --chunk-size 10 is three writes, not twenty-five."""
+        fake = _RecordingStdout()
+        with mock.patch.object(sys, "stdout", fake):
+            ret = main(["-p", "**", "--charset", "abcde", "--chunk-size", "10"])
+
+        assert ret == 0
+        assert len(fake.writes) == 3
+        assert "".join(fake.writes) == "".join(
+            f"{a}{b}\n" for a in "abcde" for b in "abcde"
+        )
+
+    def test_a_terminal_still_gets_one_line_at_a_time(self) -> None:
+        """At a tty a person is reading along, so latency beats throughput."""
+        fake = _RecordingStdout(tty=True)
+        with mock.patch.object(sys, "stdout", fake):
+            ret = main(["-p", "a*", "--charset", "abc"])
+
+        assert ret == 0
+        assert fake.writes == ["aa\n", "ab\n", "ac\n"]
+
+    def test_output_text_is_unchanged_by_chunking(self) -> None:
+        """Whatever the chunk size, the bytes on the stream are the same."""
+        rendered = set()
+        for chunk_size in ("1", "3", "7", "10000"):
+            fake = _RecordingStdout()
+            with mock.patch.object(sys, "stdout", fake):
+                assert main(["-p", "a*", "--charset", "xyz",
+                             "--chunk-size", chunk_size]) == 0
+            rendered.add("".join(fake.writes))
+
+        assert rendered == {"ax\nay\naz\n"}
+
+
+class TestChunkedWritePolling:
+    """A large --chunk-size must not stretch the gap between stop polls."""
+
+    def test_block_is_capped_while_a_stop_predicate_is_installed(self) -> None:
+        """Polling every 10k words is what keeps Ctrl-C responsive."""
+        polls = 0
+
+        def should_stop() -> bool:
+            nonlocal polls
+            polls += 1
+            return False
+
+        buf = io.StringIO()
+        total = _chunked_write(
+            [f"w{i}" for i in range(25_000)], buf,
+            chunk_size=1_000_000, should_stop=should_stop,
+        )
+
+        assert total == 25_000
+        # 25k words at a 10k cap: three chunks, plus the poll on the last one.
+        assert polls == 3
+
+    def test_no_predicate_uses_the_requested_chunk_size(self) -> None:
+        """Without a poll to pace, the full chunk is written in one go."""
+        buf = io.StringIO()
+        writes: list[str] = []
+        with mock.patch.object(
+            buf, "write", lambda data: (writes.append(data), len(data))[1]
+        ):
+            total = _chunked_write(
+                [f"w{i}" for i in range(25_000)], buf, chunk_size=1_000_000
+            )
+
+        assert total == 25_000
+        assert len(writes) == 1
+
+
+class TestFilterStageBypass:
+    """An unconfigured filter stage is a generator resumed once per word."""
+
+    @staticmethod
+    def _cfg(argv: list[str]) -> bitbrew._RunConfig:
+        return _resolve_options(build_parser().parse_args(argv))
+
+    def test_has_filters_tracks_the_configured_options(self) -> None:
+        base = ["-p", "a*", "--charset", "xy"]
+        assert not self._cfg(base).has_filters
+        assert self._cfg([*base, "--min-len", "1"]).has_filters
+        assert self._cfg([*base, "--max-len", "9"]).has_filters
+        assert self._cfg([*base, "--filter", "a"]).has_filters
+
+    def test_discards_candidates_still_counts_dedup(self) -> None:
+        """The --force guard depends on this staying true for dedup alone."""
+        cfg = self._cfg(["-p", "a?", "-p", "b*", "--charset", "xy"])
+        assert not cfg.has_filters
+        assert cfg.discards_candidates
+
+    def test_bypassing_the_stage_does_not_change_the_stream(self) -> None:
+        """The unfiltered pipeline must emit exactly what filtering allowed."""
+        unfiltered = list(bitbrew._build_pipeline(self._cfg(["-p", "a*", "--charset", "xyz"])))
+        permissive = list(
+            bitbrew._build_pipeline(
+                self._cfg(["-p", "a*", "--charset", "xyz", "--min-len", "0"])
+            )
+        )
+        assert unfiltered == permissive == ["ax", "ay", "az"]
