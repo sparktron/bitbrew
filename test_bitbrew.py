@@ -2501,6 +2501,32 @@ class TestProbeSeedSelection:
         assert bitbrew._probe_seeds(r'([^"]*)*$') == ["a"]
         assert re.compile(r"[^\"]").match("a")
 
+    def test_repetition_material_survives_the_seed_cap(self) -> None:
+        """A quantified group must contribute seeds before leading literals do.
+
+        The cap applied in source order let four leading escapes spend every
+        slot before the scan reached the group that actually blows up, so
+        this pattern passed both screening layers while being exponential on
+        repeated "d" (106 ms at 18 characters, 1.7 s at 22).
+        """
+        pattern = r"\s?\d?\w?\D?(d|d)+$"
+        assert bitbrew._probe_seeds(pattern)[0] == "d"
+        assert _check_regex_safety(pattern) is None, "structural check is blind here"
+        assert _probe_regex_blowup(re.compile(pattern), pattern) is not None
+
+    @pytest.mark.parametrize(
+        ("pattern", "first"),
+        [(r"pass\d+", "0"), (r"[a-z]+", "a"), (r"abc(xy|xy)*$", "x"),
+         (r"ab(q|q){2,}$", "q")],
+    )
+    def test_quantified_material_is_tried_first(self, pattern: str, first: str) -> None:
+        """Backtracking is driven by what a repetition can consume."""
+        assert bitbrew._probe_seeds(pattern)[0] == first
+
+    def test_unbalanced_group_still_yields_seeds(self) -> None:
+        """An unclosed "(" is a syntax error, but must not lose its characters."""
+        assert "q" in bitbrew._probe_seeds(r"(q")
+
     def test_seed_count_stays_capped(self) -> None:
         """More seeds means more probing, and screening must stay cheap."""
         seeds = bitbrew._probe_seeds(r"abcdefghij")

@@ -458,11 +458,17 @@ def _probe_seeds(pattern: str) -> list[str]:
     than a fixed alphabet. Reading that off the source text alone is not enough:
     "\\s" is matched by a space and never by the letter "s", so scanning for
     alphanumerics probes such a pattern with input it rejects on the first
-    character and reports every one of them as safe. "(\\s|\\s)+$" is
-    catastrophic, and the structural check does not see overlapping alternation.
+    character and reports every one of them as safe. Escapes and character-class
+    contents are therefore resolved to something they match, and literal
+    punctuation counts as well as letters.
 
-    Escapes and character-class contents are therefore resolved to something
-    they match, and literal punctuation counts as well as letters.
+    Which characters are kept matters as much as how they are read. Backtracking
+    is driven by what a *repetition* can consume, so characters inside a
+    quantified group or class are tried first and the rest only fill the
+    remaining slots. Taking them in source order instead lets a pattern's
+    opening literals spend the whole seed budget before the scan reaches the
+    group that blows up: "\\s?\\d?\\w?\\D?(d|d)+$" is exponential on repeated
+    "d", and four leading escapes are enough to crowd "d" out entirely.
 
     Args:
         pattern: The raw regex source.
@@ -470,31 +476,54 @@ def _probe_seeds(pattern: str) -> list[str]:
     Returns:
         Repeat units to build probe strings from.
     """
-    chars: list[str] = []
+    repeated: list[str] = []
+    plain: list[str] = []
+    groups: list[list[str]] = []
 
-    def offer(char: str) -> None:
-        if char and char not in chars:
-            chars.append(char)
+    def keep(members: list[str], after: int) -> None:
+        """File characters by whether a repetition can consume them."""
+        if _is_variable_repetition(pattern, after):
+            repeated.extend(members)
+        elif groups:
+            groups[-1].extend(members)
+        else:
+            plain.extend(members)
 
     index = 0
-    while index < len(pattern) and len(chars) < _PROBE_MAX_SEEDS:
+    while index < len(pattern):
         char = pattern[index]
         if char == "\\":
-            if index + 1 < len(pattern):
-                following = pattern[index + 1]
-                offer(_CLASS_MEMBERS.get(following, following))
+            following = pattern[index + 1] if index + 1 < len(pattern) else ""
             index += 2
+            keep([_CLASS_MEMBERS.get(following, following)], index)
             continue
         if char == "[":
             members, index = _class_members(pattern, index)
-            for member in members:
-                offer(member)
+            keep(members, index)
             continue
-        if char not in _METACHARACTERS:
-            offer(char)
+        if char == "(":
+            groups.append([])
+            index += 1
+            continue
+        if char == ")" and groups:
+            inner = groups.pop()
+            index += 1
+            keep(inner, index)
+            continue
         index += 1
+        if char not in _METACHARACTERS:
+            keep([char], index)
+    # An unbalanced "(" leaves its characters behind; re.compile reports the
+    # syntax error, but they are still usable probe material until it does.
+    for unclosed in groups:
+        plain.extend(unclosed)
 
-    del chars[_PROBE_MAX_SEEDS:]
+    chars: list[str] = []
+    for char in (*repeated, *plain):
+        if char and char not in chars:
+            chars.append(char)
+        if len(chars) >= _PROBE_MAX_SEEDS:
+            break
     if not chars:
         chars = ["a"]
     seeds = list(chars)
