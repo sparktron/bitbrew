@@ -381,12 +381,65 @@ def _check_regex_safety(pattern: str) -> str | None:
     return None
 
 
+# One character each shorthand class actually matches. Reading "\\s" as the
+# letter "s" seeds a probe with input the pattern rejects outright.
+_CLASS_MEMBERS = {"s": " ", "d": "0", "w": "a", "S": "x", "D": "x", "W": " "}
+
+# Regex syntax rather than material to build probe strings from.
+_METACHARACTERS = frozenset("()[]{}|*+?^$.\\")
+
+
+def _class_members(pattern: str, index: int) -> tuple[list[str], int]:
+    """Collect characters the bracket class at index can match.
+
+    Args:
+        pattern: The raw regex source.
+        index: Position of the opening "[".
+
+    Returns:
+        (members, next_index). members is empty for a negated class, whose
+        contents are what it cannot match; the generic fallback seed suits
+        those better than anything listed inside.
+    """
+    index += 1
+    negated = index < len(pattern) and pattern[index] == "^"
+    if negated:
+        index += 1
+    members: list[str] = []
+    first = True
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\":
+            if index + 1 < len(pattern):
+                following = pattern[index + 1]
+                members.append(_CLASS_MEMBERS.get(following, following))
+            index += 2
+            first = False
+            continue
+        if char == "]" and not first:
+            index += 1
+            break
+        # "-" spells a range; its endpoints are already being collected.
+        if char != "-":
+            members.append(char)
+        first = False
+        index += 1
+    return ([], index) if negated else (members, index)
+
+
 def _probe_seeds(pattern: str) -> list[str]:
     """Pick adversarial repeat units for probing, drawn from the pattern itself.
 
     A pattern only backtracks catastrophically on input built from characters it
-    can actually consume, so the literals it mentions make far better probe
-    material than a fixed alphabet.
+    can actually consume, so what it mentions makes far better probe material
+    than a fixed alphabet. Reading that off the source text alone is not enough:
+    "\\s" is matched by a space and never by the letter "s", so scanning for
+    alphanumerics probes such a pattern with input it rejects on the first
+    character and reports every one of them as safe. "(\\s|\\s)+$" is
+    catastrophic, and the structural check does not see overlapping alternation.
+
+    Escapes and character-class contents are therefore resolved to something
+    they match, and literal punctuation counts as well as letters.
 
     Args:
         pattern: The raw regex source.
@@ -395,11 +448,30 @@ def _probe_seeds(pattern: str) -> list[str]:
         Repeat units to build probe strings from.
     """
     chars: list[str] = []
-    for char in re.findall(r"[A-Za-z0-9]", pattern):
-        if char not in chars:
+
+    def offer(char: str) -> None:
+        if char and char not in chars:
             chars.append(char)
-        if len(chars) >= _PROBE_MAX_SEEDS:
-            break
+
+    index = 0
+    while index < len(pattern) and len(chars) < _PROBE_MAX_SEEDS:
+        char = pattern[index]
+        if char == "\\":
+            if index + 1 < len(pattern):
+                following = pattern[index + 1]
+                offer(_CLASS_MEMBERS.get(following, following))
+            index += 2
+            continue
+        if char == "[":
+            members, index = _class_members(pattern, index)
+            for member in members:
+                offer(member)
+            continue
+        if char not in _METACHARACTERS:
+            offer(char)
+        index += 1
+
+    del chars[_PROBE_MAX_SEEDS:]
     if not chars:
         chars = ["a"]
     seeds = list(chars)

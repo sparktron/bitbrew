@@ -2455,3 +2455,79 @@ class TestStdoutTerminalDetection:
 
         assert ret == 0
         assert fake.data == "ax\nay\n"
+
+
+class TestProbeSeedSelection:
+    """Probe material must be something the pattern can actually consume.
+
+    Seeds were scanned off the source text with [A-Za-z0-9], so "\\s" seeded
+    the letter "s" -- which "\\s" never matches. Every probe string was then
+    rejected on its first character and the pattern was reported fast and
+    safe. Combined with the structural check's blindness to overlapping
+    alternation, that left "(\\s|\\s)+$" passing both layers.
+    """
+
+    @pytest.mark.parametrize(
+        ("pattern", "expected"),
+        [
+            (r"\s", " "), (r"\d", "0"), (r"\w", "a"), (r"\W", " "),
+            (r"\.", "."), (r"\\", "\\"),
+        ],
+    )
+    def test_escapes_seed_a_character_they_match(
+        self, pattern: str, expected: str
+    ) -> None:
+        """A shorthand class resolves to a member, not to its own letter."""
+        assert bitbrew._probe_seeds(pattern) == [expected]
+        if expected.isalnum():
+            return
+        compiled = re.compile(pattern)
+        assert compiled.match(expected), f"{pattern} should match {expected!r}"
+
+    def test_literal_punctuation_is_usable_probe_material(self) -> None:
+        """Only letters and digits counted before, so " " was never a seed."""
+        assert bitbrew._probe_seeds(r"( | )+$") == [" "]
+        assert bitbrew._probe_seeds(r"(-|-)+$") == ["-"]
+
+    def test_character_class_members_are_collected(self) -> None:
+        """Range endpoints are members; "-" itself spells the range."""
+        assert bitbrew._probe_seeds(r"[a-z]+") == ["a", "z", "az"]
+        assert bitbrew._probe_seeds(r"[\s]+") == [" "]
+
+    def test_negated_class_falls_back_rather_than_seeding_non_members(self) -> None:
+        """A negated class lists exactly what it cannot match."""
+        assert bitbrew._probe_seeds(r'([^"]*)*$') == ["a"]
+        assert re.compile(r"[^\"]").match("a")
+
+    def test_seed_count_stays_capped(self) -> None:
+        """More seeds means more probing, and screening must stay cheap."""
+        seeds = bitbrew._probe_seeds(r"abcdefghij")
+        assert len(seeds) == bitbrew._PROBE_MAX_SEEDS + 1  # +1 for the pair
+
+    @pytest.mark.parametrize("pattern", [r"(\s|\s)+$", r"(\d|\d)+$", r"( | )+$"])
+    def test_class_based_alternation_redos_is_now_probed_out(
+        self, pattern: str
+    ) -> None:
+        """These are exponential, and the structural check does not see them."""
+        assert _check_regex_safety(pattern) is None, "structural check is blind here"
+        assert _probe_regex_blowup(re.compile(pattern), pattern) is not None
+
+    @pytest.mark.parametrize(
+        "pattern", [r"\s+", r"[ \t]+", r"\d{2,4}", r"^\w+@\w+\.\w+$", r"a - b"]
+    )
+    def test_safe_whitespace_patterns_are_not_false_positives(
+        self, pattern: str
+    ) -> None:
+        """Richer seeds must not start rejecting ordinary filters."""
+        assert _probe_regex_blowup(re.compile(pattern), pattern) is None
+
+    def test_cli_refuses_whitespace_alternation_redos(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """End to end: a filter that would hang the run is refused."""
+        ret = main(["-p", "a*", "--charset", "ab", "--filter", r"(\s|\s)+$"])
+
+        assert ret == 1
+        stderr = capsys.readouterr().err
+        assert "unsafe regex" in stderr
+        assert "backtracking" in stderr

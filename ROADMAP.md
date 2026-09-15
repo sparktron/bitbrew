@@ -19,6 +19,8 @@
 - Count range brace quantifiers as repetitions when screening `--filter` regexes.
 - Expand patterns entirely in C by folding literal runs into the wildcard product.
 - Honour `--chunk-size` on the stdout stream, keeping a terminal line-at-a-time.
+- Seed the ReDoS timing probe with characters the pattern matches rather than the
+  characters of its source, so class-based alternation such as `(\s|\s)+$` is screened.
 
 ## Next
 

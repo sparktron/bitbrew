@@ -176,7 +176,10 @@ two ways before generating anything:
 2. **Timing probe** — matches the regex against a short ladder of adversarial inputs built
    from the pattern's own alphabet and rejects it if the time grows exponentially. This
    catches the overlapping-alternation family, like `(a|a)+$` and `(a|b|ab)*$`, that no
-   structural check sees.
+   structural check sees. The alphabet is what the pattern *matches*, not the characters
+   of its source: `\s` contributes a space, `\d` a digit, and literal punctuation counts,
+   so `(\s|\s)+$` is probed with whitespace rather than with the letter `s` it can never
+   consume.
 
 The probe costs well under a millisecond for a normal filter and stops after a match pushes
 its cumulative work over the time budget. The structural pass itself is linear, including
@@ -189,7 +192,7 @@ indicates catastrophic backtracking (ReDoS). Use --allow-unsafe-regex to run it 
 ```
 
 > ⚠️ Screening is a **heuristic, not a guarantee**. It can miss a pathological pattern
-> whose trigger does not resemble its own literals, and the structural check still rejects
+> whose trigger does not resemble anything it mentions, and the structural check still rejects
 > a few safe patterns such as `(ab+c)+`. Override it with `--allow-unsafe-regex` when you
 > know a filter is fine — and do not treat it as a security boundary for regexes that come
 > from somewhere you do not trust.
