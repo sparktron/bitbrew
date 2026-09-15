@@ -19,6 +19,7 @@ Usage as a library:
 import argparse
 import contextlib
 import dataclasses
+import difflib
 import errno
 import gzip
 import itertools
@@ -92,6 +93,28 @@ def resolve_charset(spec: str) -> str:
             # Treat as raw characters
             chars += part
     return _dedupe_chars(chars)
+
+
+def _mistyped_preset(part: str) -> str | None:
+    """Find the preset a --charset part looks like a misspelling of.
+
+    --charset accepts preset names or raw characters, so an unrecognised part
+    is silently a set of literal characters rather than an error:
+    "lower,digts" quietly drops every digit and adds d, i, g, t and s instead.
+    Close-matching against the preset names is what separates a typo from a
+    deliberate raw set -- "abc", "qwerty" and "aeiou" resemble no preset, while
+    "digts", "lowercase" and "ALL" plainly do.
+
+    Args:
+        part: One comma-separated piece of a --charset value.
+
+    Returns:
+        The preset it probably meant, or None when it looks deliberate.
+    """
+    if part in CHARSETS:
+        return None
+    matches = difflib.get_close_matches(part.lower(), CHARSETS, n=1, cutoff=0.6)
+    return matches[0] if matches else None
 
 
 def _dedupe_chars(chars: str) -> str:
@@ -1228,7 +1251,19 @@ def _resolve_charset_option(args: argparse.Namespace) -> str:
             raise _CliError(
                 f"could not read --charset-file '{args.charset_file}': {exc}"
             ) from exc
-    return resolve_charset(args.charset if args.charset is not None else "lower")
+    spec = args.charset if args.charset is not None else "lower"
+    # A warning rather than an error: a raw charset is allowed to look like
+    # anything, so refusing would break legitimate values to catch a typo.
+    for part in spec.split(","):
+        stripped = part.strip()
+        suggestion = _mistyped_preset(stripped)
+        if suggestion is not None:
+            print(
+                f"Warning: --charset part '{stripped}' is not a preset, so it is "
+                f"being used as literal characters. Did you mean '{suggestion}'?",
+                file=sys.stderr,
+            )
+    return resolve_charset(spec)
 
 
 def _resolve_regex_option(args: argparse.Namespace) -> "re.Pattern[str] | None":

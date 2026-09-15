@@ -118,6 +118,20 @@ bitbrew -p "**" --charset "aeiou0123"
 
 Duplicate characters in the resolved charset are automatically removed.
 
+Because an unrecognised name is taken as raw characters, a mistyped preset is otherwise
+silent — `--charset "lower,digts"` quietly generates a wordlist with no digits in it at
+all. bitbrew warns when a part looks like a preset it does not recognise, and names the
+one you probably meant. Deliberate raw charsets such as `abc` or `qwerty` resemble no
+preset and stay silent:
+
+```bash
+$ bitbrew -p "***" --charset "lower,digts"
+Warning: --charset part 'digts' is not a preset, so it is being used as literal
+characters. Did you mean 'digits'?
+```
+
+It is a warning, not a rejection — a raw charset is allowed to look like anything.
+
 **Commas and spaces** cannot be expressed through `--charset`, since it splits on commas
 and trims whitespace. Use `--charset-file` to supply a charset verbatim — every character
 in the file is used as-is, apart from a single trailing newline:

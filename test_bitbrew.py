@@ -22,6 +22,7 @@ import bitbrew
 from bitbrew import (
     _BLOOM_MAX_BYTES,
     _MAX_ESTIMATE,
+    CHARSETS,
     _apply_filters,
     _BloomFilter,
     _check_regex_safety,
@@ -2531,3 +2532,69 @@ class TestProbeSeedSelection:
         stderr = capsys.readouterr().err
         assert "unsafe regex" in stderr
         assert "backtracking" in stderr
+
+
+class TestMistypedCharsetPreset:
+    """An unknown --charset part is literal characters, which hides typos."""
+
+    @pytest.mark.parametrize(
+        ("part", "meant"),
+        [("digts", "digits"), ("digit", "digits"), ("lowe", "lower"),
+         ("lowercase", "lower"), ("uppercase", "upper"), ("symbol", "symbols"),
+         ("ALL", "all"), ("Digits", "digits")],
+    )
+    def test_typos_are_matched_to_a_preset(self, part: str, meant: str) -> None:
+        assert bitbrew._mistyped_preset(part) == meant
+
+    @pytest.mark.parametrize(
+        "part",
+        ["abc", "xyz", "abc123", "aeiou", "qwerty", "hex", "0123456789abcdef",
+         "!@#$", "ab", "a", "zzz", "vowels", "cba", "pass", "admin", "root"],
+    )
+    def test_deliberate_raw_charsets_are_not_flagged(self, part: str) -> None:
+        """A raw charset may look like anything; false positives are worse."""
+        assert bitbrew._mistyped_preset(part) is None
+
+    @pytest.mark.parametrize("part", ["lower", "upper", "digits", "symbols", "all"])
+    def test_real_presets_are_not_flagged(self, part: str) -> None:
+        assert bitbrew._mistyped_preset(part) is None
+
+    def test_cli_warns_and_names_the_preset(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """'lower,digts' silently drops every digit; say so."""
+        ret = main(["-p", "*", "--charset", "lower,digts", "--count"])
+
+        assert ret == 0
+        stderr = capsys.readouterr().err
+        assert "'digts' is not a preset" in stderr
+        assert "Did you mean 'digits'?" in stderr
+
+    def test_warning_does_not_change_the_charset(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """It is a warning, not a rejection: the run proceeds unchanged."""
+        ret = main(["-p", "*", "--charset", "lower,digts", "--count"])
+        capsys.readouterr()
+
+        assert ret == 0
+        # 26 lowercase plus d, i, g, t, s -- all already in lower -> 26.
+        assert resolve_charset("lower,digts") == CHARSETS["lower"]
+
+    def test_legitimate_charsets_stay_silent(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        for spec in ("abc", "qwerty", "lower,digits", "!@#", "aeiou"):
+            assert main(["-p", "*", "--charset", spec, "--count"]) == 0
+            assert "not a preset" not in capsys.readouterr().err, spec
+
+    def test_charset_file_is_not_screened(
+        self, tmp_path: "os.PathLike[str]", capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--charset-file is verbatim by design, typo-shaped or not."""
+        path = os.path.join(str(tmp_path), "cs.txt")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("digts")
+
+        assert main(["-p", "*", "--charset-file", path, "--count"]) == 0
+        assert "not a preset" not in capsys.readouterr().err

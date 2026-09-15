@@ -21,6 +21,8 @@
 - Honour `--chunk-size` on the stdout stream, keeping a terminal line-at-a-time.
 - Seed the ReDoS timing probe with characters the pattern matches rather than the
   characters of its source, so class-based alternation such as `(\s|\s)+$` is screened.
+- Warn when a `--charset` part looks like a mistyped preset instead of silently using it
+  as literal characters.
 
 ## Next
 
