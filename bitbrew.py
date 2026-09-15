@@ -19,9 +19,9 @@ Usage as a library:
 import argparse
 import contextlib
 import dataclasses
+import difflib
 import errno
 import gzip
-import io
 import itertools
 import math
 import os
@@ -44,6 +44,17 @@ class _ProgressBar(Protocol):
 
     def close(self) -> None:
         """Finalise the bar. Must tolerate being called twice."""
+
+
+class _TextSink(Protocol):
+    """The slice of a text file object the writer uses.
+
+    Naming the one method needed lets the writer target a real file, sys.stdout
+    and an in-memory buffer alike without enumerating concrete classes.
+    """
+
+    def write(self, data: str, /) -> int:
+        """Write a string, returning the number of characters written."""
 
 
 class _CliError(Exception):
@@ -84,6 +95,28 @@ def resolve_charset(spec: str) -> str:
     return _dedupe_chars(chars)
 
 
+def _mistyped_preset(part: str) -> str | None:
+    """Find the preset a --charset part looks like a misspelling of.
+
+    --charset accepts preset names or raw characters, so an unrecognised part
+    is silently a set of literal characters rather than an error:
+    "lower,digts" quietly drops every digit and adds d, i, g, t and s instead.
+    Close-matching against the preset names is what separates a typo from a
+    deliberate raw set -- "abc", "qwerty" and "aeiou" resemble no preset, while
+    "digts", "lowercase" and "ALL" plainly do.
+
+    Args:
+        part: One comma-separated piece of a --charset value.
+
+    Returns:
+        The preset it probably meant, or None when it looks deliberate.
+    """
+    if part in CHARSETS:
+        return None
+    matches = difflib.get_close_matches(part.lower(), CHARSETS, n=1, cutoff=0.6)
+    return matches[0] if matches else None
+
+
 def _dedupe_chars(chars: str) -> str:
     """Remove duplicate characters, preserving first-appearance order.
 
@@ -93,13 +126,8 @@ def _dedupe_chars(chars: str) -> str:
     Returns:
         The deduplicated character string.
     """
-    seen: set[str] = set()
-    result = []
-    for char in chars:
-        if char not in seen:
-            seen.add(char)
-            result.append(char)
-    return "".join(result)
+    # dict preserves insertion order, so this is first-appearance order.
+    return "".join(dict.fromkeys(chars))
 
 
 def load_charset_file(path: str) -> str:
@@ -132,6 +160,29 @@ _DEDUP_WARN_THRESHOLD = 1_000_000  # warn above this when dedup is in play
 _BYTES_PER_WORD = 100  # measured cost of holding one short word in a set
 
 
+def _count_from_kinds(kinds: Iterable[str], charset_len: int) -> int:
+    """Count the words a parsed pattern's wildcards will produce.
+
+    Split out so callers that have already parsed a pattern -- option
+    resolution parses every one of them to validate it -- do not parse it a
+    second time just to size it.
+
+    Args:
+        kinds: Wildcard kinds, as returned by _parse_pattern.
+        charset_len: Number of characters in the active charset.
+
+    Returns:
+        Word count (capped at _MAX_ESTIMATE).
+    """
+    count = 1
+    for kind in kinds:
+        # "?" has one extra option: matching nothing at all.
+        count *= charset_len if kind == "*" else charset_len + 1
+        if count > _MAX_ESTIMATE:
+            return _MAX_ESTIMATE
+    return count
+
+
 def estimate_count(pattern: str, charset_len: int) -> int:
     """Estimate the total number of words a pattern will generate.
 
@@ -145,14 +196,7 @@ def estimate_count(pattern: str, charset_len: int) -> int:
     Raises:
         ValueError: If the pattern ends with a dangling backslash.
     """
-    _, kinds = _parse_pattern(pattern)
-    count = 1
-    for kind in kinds:
-        # "?" has one extra option: matching nothing at all.
-        count *= charset_len if kind == "*" else charset_len + 1
-        if count > _MAX_ESTIMATE:
-            return _MAX_ESTIMATE
-    return count
+    return _count_from_kinds(_parse_pattern(pattern)[1], charset_len)
 
 
 def generate_wordlist(pattern: str, charset: str = "lower") -> Generator[str, None, None]:
@@ -168,26 +212,29 @@ def generate_wordlist(pattern: str, charset: str = "lower") -> Generator[str, No
     yield from _expand_pattern(pattern, resolve_charset(charset))
 
 
-def _parse_pattern(pattern: str) -> tuple[list[str | int], list[str]]:
+def _parse_pattern(pattern: str) -> tuple[list[str], list[str]]:
     """Split a pattern into literal runs and wildcard slots.
 
     A backslash escapes the following character, so "\\*" is a literal asterisk
-    rather than a wildcard. Consecutive literals are merged into one segment so
-    the expansion loop does less work per generated word.
+    rather than a wildcard.
 
     Args:
         pattern: The pattern string.
 
     Returns:
-        (segments, kinds). segments mixes literal strings with integer indices
-        into kinds; kinds[i] is "*" or "?" for the i-th wildcard.
+        (literals, kinds). kinds[i] is "*" or "?" for the i-th wildcard, and
+        literals always holds exactly one more entry than kinds: literals[i] is
+        the text preceding wildcard i, and literals[-1] the text after the last
+        one. Any run may be empty, so every generated word is
+        literals[0] + choice[0] + literals[1] + ... + literals[len(kinds)],
+        with no positional bookkeeping left for the expansion loop to redo.
 
     Raises:
         ValueError: If the pattern ends with a dangling backslash.
     """
-    segments: list[str | int] = []
+    literals: list[str] = []
     kinds: list[str] = []
-    literal: list[str] = []
+    run: list[str] = []
     index = 0
     while index < len(pattern):
         char = pattern[index]
@@ -197,22 +244,19 @@ def _parse_pattern(pattern: str) -> tuple[list[str | int], list[str]]:
                     "pattern ends with a dangling backslash; "
                     "write '\\\\' for a literal backslash"
                 )
-            literal.append(pattern[index + 1])
+            run.append(pattern[index + 1])
             index += 2
             continue
         if char in "*?":
-            if literal:
-                segments.append("".join(literal))
-                literal.clear()
-            segments.append(len(kinds))
+            literals.append("".join(run))
+            run.clear()
             kinds.append(char)
             index += 1
             continue
-        literal.append(char)
+        run.append(char)
         index += 1
-    if literal:
-        segments.append("".join(literal))
-    return segments, kinds
+    literals.append("".join(run))
+    return literals, kinds
 
 
 def _expand_pattern(pattern: str, chars: str) -> Generator[str, None, None]:
@@ -228,20 +272,30 @@ def _expand_pattern(pattern: str, chars: str) -> Generator[str, None, None]:
     Raises:
         ValueError: If the pattern ends with a dangling backslash.
     """
-    segments, kinds = _parse_pattern(pattern)
+    literals, kinds = _parse_pattern(pattern)
 
     if not kinds:
         # No wildcards — yield the pattern's literal text, escapes resolved.
-        yield "".join(seg for seg in segments if isinstance(seg, str))
+        yield literals[0]
         return
 
-    # "?" also offers the empty string, which is how it matches zero characters.
-    wildcards = [list(chars) if kind == "*" else ["", *chars] for kind in kinds]
+    # Fold each literal run into the options of the wildcard that follows it,
+    # and the trailing run onto the last wildcard's options. Every word is then
+    # a plain concatenation of one option per slot, so itertools.product and
+    # str.join run the whole expansion in C with no per-word Python bytecode.
+    # Reassembling each word from a mixed literal/index list instead costs an
+    # isinstance test per segment per word, and measures 7-9x slower.
+    groups: list[list[str]] = []
+    for slot, kind in enumerate(kinds):
+        # "?" also offers the empty string, which is how it matches zero chars.
+        options = list(chars) if kind == "*" else ["", *chars]
+        prefix = literals[slot]
+        groups.append([prefix + option for option in options] if prefix else options)
+    suffix = literals[-1]
+    if suffix:
+        groups[-1] = [option + suffix for option in groups[-1]]
 
-    for combo in itertools.product(*wildcards):
-        yield "".join(
-            combo[seg] if isinstance(seg, int) else seg for seg in segments
-        )
+    yield from map("".join, itertools.product(*groups))
 
 
 # Timing probe: catastrophic backtracking grows exponentially with input
@@ -254,12 +308,53 @@ _PROBE_BUDGET = 0.05  # seconds of cumulative match time before we call it unsaf
 _PROBE_MAX_SEEDS = 4
 
 
+# A brace quantifier spanning a range. "{3}" is deliberately not matched: a
+# fixed count leaves the engine no alternative lengths to backtrack over.
+_BRACE_QUANTIFIER = re.compile(r"\{(\d*),(\d*)\}")
+
+
+def _is_variable_repetition(pattern: str, index: int) -> bool:
+    """Report whether a repetition of more than one length starts at index.
+
+    "*" and "+" always are. A brace quantifier is one only when it spans a
+    range: "a{2,5}" and "a{2,}" leave the engine a choice it can backtrack
+    over, while "a{3}" is a fixed count with nothing to reconsider.
+
+    Args:
+        pattern: The raw regex source.
+        index: Position to test.
+
+    Returns:
+        True if a variable-length repetition starts at index.
+    """
+    if index >= len(pattern):
+        return False
+    char = pattern[index]
+    if char in "+*":
+        return True
+    if char != "{":
+        return False
+    match = _BRACE_QUANTIFIER.match(pattern, index)
+    if match is None:
+        return False
+    low, high = match.group(1), match.group(2)
+    if not low and not high:
+        # Python reads a bare "{,}" as three literal characters.
+        return False
+    return not high or int(high) > int(low or 0)
+
+
 def _check_regex_safety(pattern: str) -> str | None:
     """Check a regex pattern for common ReDoS indicators.
 
     This is a structural check only; see _probe_regex_blowup for the empirical
     one. The scanner is linear and skips escaped characters and character
     classes, where metacharacters are literals rather than quantifiers.
+
+    Repetition means "*", "+", or a brace quantifier spanning a range, on
+    either side of the nesting: "(a{1,3})+" and "(a+){2,}" backtrack just as
+    badly as "(a+)+". Missing those left them to the timing probe, which
+    charges a hundred milliseconds to reach a vaguer answer.
 
     Args:
         pattern: The raw regex source.
@@ -294,7 +389,7 @@ def _check_regex_safety(pattern: str) -> str | None:
             group_repetitions.append(False)
         elif char == ")" and group_repetitions:
             contains_repetition = group_repetitions.pop()
-            is_repeated = index + 1 < len(pattern) and pattern[index + 1] in "+*"
+            is_repeated = _is_variable_repetition(pattern, index + 1)
             if contains_repetition and is_repeated:
                 return (
                     "pattern contains nested quantifiers which can cause catastrophic "
@@ -302,19 +397,78 @@ def _check_regex_safety(pattern: str) -> str | None:
                 )
             if group_repetitions:
                 group_repetitions[-1] |= contains_repetition or is_repeated
-        elif char in "+*" and group_repetitions:
+        elif group_repetitions and _is_variable_repetition(pattern, index):
             group_repetitions[-1] = True
         index += 1
 
     return None
 
 
+# One character each shorthand class actually matches. Reading "\\s" as the
+# letter "s" seeds a probe with input the pattern rejects outright.
+_CLASS_MEMBERS = {"s": " ", "d": "0", "w": "a", "S": "x", "D": "x", "W": " "}
+
+# Regex syntax rather than material to build probe strings from.
+_METACHARACTERS = frozenset("()[]{}|*+?^$.\\")
+
+
+def _class_members(pattern: str, index: int) -> tuple[list[str], int]:
+    """Collect characters the bracket class at index can match.
+
+    Args:
+        pattern: The raw regex source.
+        index: Position of the opening "[".
+
+    Returns:
+        (members, next_index). members is empty for a negated class, whose
+        contents are what it cannot match; the generic fallback seed suits
+        those better than anything listed inside.
+    """
+    index += 1
+    negated = index < len(pattern) and pattern[index] == "^"
+    if negated:
+        index += 1
+    members: list[str] = []
+    first = True
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\":
+            if index + 1 < len(pattern):
+                following = pattern[index + 1]
+                members.append(_CLASS_MEMBERS.get(following, following))
+            index += 2
+            first = False
+            continue
+        if char == "]" and not first:
+            index += 1
+            break
+        # "-" spells a range; its endpoints are already being collected.
+        if char != "-":
+            members.append(char)
+        first = False
+        index += 1
+    return ([], index) if negated else (members, index)
+
+
 def _probe_seeds(pattern: str) -> list[str]:
     """Pick adversarial repeat units for probing, drawn from the pattern itself.
 
     A pattern only backtracks catastrophically on input built from characters it
-    can actually consume, so the literals it mentions make far better probe
-    material than a fixed alphabet.
+    can actually consume, so what it mentions makes far better probe material
+    than a fixed alphabet. Reading that off the source text alone is not enough:
+    "\\s" is matched by a space and never by the letter "s", so scanning for
+    alphanumerics probes such a pattern with input it rejects on the first
+    character and reports every one of them as safe. Escapes and character-class
+    contents are therefore resolved to something they match, and literal
+    punctuation counts as well as letters.
+
+    Which characters are kept matters as much as how they are read. Backtracking
+    is driven by what a *repetition* can consume, so characters inside a
+    quantified group or class are tried first and the rest only fill the
+    remaining slots. Taking them in source order instead lets a pattern's
+    opening literals spend the whole seed budget before the scan reaches the
+    group that blows up: "\\s?\\d?\\w?\\D?(d|d)+$" is exponential on repeated
+    "d", and four leading escapes are enough to crowd "d" out entirely.
 
     Args:
         pattern: The raw regex source.
@@ -322,9 +476,51 @@ def _probe_seeds(pattern: str) -> list[str]:
     Returns:
         Repeat units to build probe strings from.
     """
+    repeated: list[str] = []
+    plain: list[str] = []
+    groups: list[list[str]] = []
+
+    def keep(members: list[str], after: int) -> None:
+        """File characters by whether a repetition can consume them."""
+        if _is_variable_repetition(pattern, after):
+            repeated.extend(members)
+        elif groups:
+            groups[-1].extend(members)
+        else:
+            plain.extend(members)
+
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\":
+            following = pattern[index + 1] if index + 1 < len(pattern) else ""
+            index += 2
+            keep([_CLASS_MEMBERS.get(following, following)], index)
+            continue
+        if char == "[":
+            members, index = _class_members(pattern, index)
+            keep(members, index)
+            continue
+        if char == "(":
+            groups.append([])
+            index += 1
+            continue
+        if char == ")" and groups:
+            inner = groups.pop()
+            index += 1
+            keep(inner, index)
+            continue
+        index += 1
+        if char not in _METACHARACTERS:
+            keep([char], index)
+    # An unbalanced "(" leaves its characters behind; re.compile reports the
+    # syntax error, but they are still usable probe material until it does.
+    for unclosed in groups:
+        plain.extend(unclosed)
+
     chars: list[str] = []
-    for char in re.findall(r"[A-Za-z0-9]", pattern):
-        if char not in chars:
+    for char in (*repeated, *plain):
+        if char and char not in chars:
             chars.append(char)
         if len(chars) >= _PROBE_MAX_SEEDS:
             break
@@ -405,9 +601,7 @@ def _deduplicated(words: Iterable[str]) -> Generator[str, None, None]:
             yield word
 
 
-def _text_writer(
-    file_obj: "gzip.GzipFile | io.TextIOBase | io.StringIO",
-) -> Callable[[str], None]:
+def _text_writer(file_obj: "gzip.GzipFile | _TextSink") -> Callable[[str], None]:
     """Adapt a text-mode or binary-gzip destination to one str-writing call.
 
     Resolving the text/binary question once, here, keeps it out of the write
@@ -486,62 +680,67 @@ def _interruptible(
     Raises:
         KeyboardInterrupt: When should_stop() returns True.
     """
-    for seen, word in enumerate(words, 1):
-        if seen % _STOP_CHECK_INTERVAL == 0 and should_stop():
-            raise KeyboardInterrupt
+    # A countdown rather than enumerate() plus a modulo: this runs once per
+    # candidate over a space that can reach billions, and the running total
+    # grows out of machine-word range while the countdown never does.
+    countdown = _STOP_CHECK_INTERVAL
+    for word in words:
+        countdown -= 1
+        if not countdown:
+            countdown = _STOP_CHECK_INTERVAL
+            if should_stop():
+                raise KeyboardInterrupt
         yield word
 
 
 def _chunked_write(
     words: Iterable[str],
-    file_obj: "gzip.GzipFile | io.TextIOBase | io.StringIO",
+    file_obj: "gzip.GzipFile | _TextSink",
     chunk_size: int,
     progress: _ProgressBar | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> int:
     """Write words to a file in chunks.
 
+    Collecting each chunk with itertools.islice keeps the per-word work in C:
+    appending and counting in Python cost roughly three times as much, and this
+    loop sees every word the run emits.
+
     Args:
         words: Word iterable.
         file_obj: File object to write to (text-mode or binary gzip).
         chunk_size: Number of words per chunk.
         progress: Optional tqdm progress bar to update.
-        should_stop: Optional predicate polled every _STOP_CHECK_INTERVAL words
-            (or every chunk, whichever is smaller). When it returns True the
-            write is abandoned.
+        should_stop: Optional predicate polled once per chunk. When it returns
+            True the write is abandoned. While it is installed, chunks are
+            capped at _STOP_CHECK_INTERVAL words so a large --chunk-size cannot
+            stretch the gap between polls; that only splits the write calls,
+            which the destination buffers back together anyway.
 
     Returns:
         Total number of words written.
 
     Raises:
-        KeyboardInterrupt: If should_stop() returns True mid-write.
+        KeyboardInterrupt: If should_stop() returns True between chunks.
     """
     write = _text_writer(file_obj)
+    stream = iter(words)
+    block = chunk_size if should_stop is None else min(chunk_size, _STOP_CHECK_INTERVAL)
     total = 0
-    buf: list[str] = []
-
-    def flush() -> None:
-        nonlocal total
-        write("\n".join(buf) + "\n")
+    while True:
+        chunk = list(itertools.islice(stream, block))
+        if not chunk:
+            return total
+        count = len(chunk)
+        # A trailing "" ends the joined block with a newline. Appending one
+        # instead would copy a string the size of the whole chunk.
+        chunk.append("")
+        write("\n".join(chunk))
         if progress is not None:
-            progress.update(len(buf))
-        total += len(buf)
-        buf.clear()
-
-    check_every = min(chunk_size, _STOP_CHECK_INTERVAL)
-    since_check = 0
-    for word in words:
-        buf.append(word)
-        if len(buf) >= chunk_size:
-            flush()
-        since_check += 1
-        if since_check >= check_every:
-            since_check = 0
-            if should_stop is not None and should_stop():
-                raise KeyboardInterrupt
-    if buf:
-        flush()
-    return total
+            progress.update(count)
+        total += count
+        if should_stop is not None and should_stop():
+            raise KeyboardInterrupt
 
 
 def _needs_dedup(patterns: list[str]) -> bool:
@@ -607,7 +806,10 @@ def _create_sidecar(output_path: str) -> tuple[int, str]:
 
     Raises:
         OSError: If the file cannot be created, including exhausting the name
-            attempts.
+            attempts. The exhaustion error deliberately carries no errno:
+            OSError maps errno.EEXIST to FileExistsError, and the caller reads
+            that as "the output path is taken" and tells the user to pass
+            --overwrite, which would not help.
     """
     directory = os.path.dirname(output_path) or "."
     prefix = os.path.basename(output_path)
@@ -619,8 +821,8 @@ def _create_sidecar(output_path: str) -> tuple[int, str]:
             continue
         return handle, path
     raise OSError(
-        errno.EEXIST,
-        f"could not find an unused sidecar name next to '{output_path}'",
+        f"could not find an unused sidecar name next to '{output_path}' "
+        f"after {_SIDECAR_ATTEMPTS} attempts"
     )
 
 
@@ -759,7 +961,13 @@ class _BloomFilter:
     judged already-seen and dropped, so this is never the default.
     """
 
-    def __init__(self, capacity: int, error_rate: float, max_bytes: int) -> None:
+    def __init__(
+        self,
+        capacity: int,
+        error_rate: float,
+        max_bytes: int,
+        plan: _BloomSizing | None = None,
+    ) -> None:
         """Size a filter for the expected number of items and allocate it.
 
         Args:
@@ -768,12 +976,18 @@ class _BloomFilter:
             max_bytes: Hard ceiling on memory; the achieved rate degrades if the
                 ideal size would exceed it. Callers that care should consult
                 _plan_bloom first -- see _dedup_stage.
+            plan: A sizing already computed for these arguments. Passing it back
+                keeps the filter that gets allocated identical to the one the
+                caller checked and reported, rather than a recomputation that
+                has to be trusted to agree.
 
         Raises:
             _CliError: If the bit array does not fit in available memory.
         """
         self.capacity = max(1, capacity)
-        self.plan = _plan_bloom(self.capacity, error_rate, max_bytes)
+        if plan is None:
+            plan = _plan_bloom(self.capacity, error_rate, max_bytes)
+        self.plan = plan
         self.bits = self.plan.bits
         self.hash_count = self.plan.hash_count
         try:
@@ -795,13 +1009,16 @@ class _BloomFilter:
         """False-positive rate this filter actually achieves at capacity."""
         return self.plan.error_rate
 
-    def _positions(self, item: str) -> list[int]:
+    def _positions(self, item: str) -> Iterator[int]:
         """Derive this item's bit positions.
+
+        This is the definition of the probe scheme; add_if_absent inlines it
+        for speed, and a test holds the two to the same answers.
 
         Args:
             item: The word to hash.
 
-        Returns:
+        Yields:
             hash_count bit indices.
         """
         # Kirsch-Mitzenmacher: k probes derived from two hashes. hash() is
@@ -810,7 +1027,8 @@ class _BloomFilter:
         # tracks theory.
         first = hash(item)
         second = hash(item + "\x00bitbrew") | 1
-        return [(first + probe * second) % self.bits for probe in range(self.hash_count)]
+        for probe in range(self.hash_count):
+            yield (first + probe * second) % self.bits
 
     def probably_contains(self, item: str) -> bool:
         """Query membership without recording the item.
@@ -836,13 +1054,21 @@ class _BloomFilter:
             True if the item was probably absent, False if probably present.
             False may be wrong at the filter's error rate; True never is.
         """
+        # _positions inlined: this runs once per candidate word, and stepping
+        # the position by `second` each time is the same sequence as
+        # (first + probe * second) without the multiply or the generator
+        # resume. TestBloomProbeScheme holds the two forms to one answer.
         array = self._array
+        bits = self.bits
+        position = hash(item) % bits
+        second = hash(item + "\x00bitbrew") | 1
         seen = True
-        for position in self._positions(item):
+        for _ in range(self.hash_count):
             index, mask = position >> 3, 1 << (position & 7)
             if not array[index] & mask:
                 seen = False
                 array[index] |= mask
+            position = (position + second) % bits
         return not seen
 
 
@@ -883,6 +1109,19 @@ class _RunConfig:
     count_only: bool
 
     @property
+    def has_filters(self) -> bool:
+        """Whether any length bound or regex filter is configured.
+
+        Returns:
+            True if the filter stage would reject anything.
+        """
+        return (
+            self.min_len is not None
+            or self.max_len is not None
+            or self.regex is not None
+        )
+
+    @property
     def discards_candidates(self) -> bool:
         """Whether a stage between generation and output can drop candidates.
 
@@ -892,12 +1131,7 @@ class _RunConfig:
         Returns:
             True if filtering or deduplication sits in the pipeline.
         """
-        return (
-            self.min_len is not None
-            or self.max_len is not None
-            or self.regex is not None
-            or self.dedup != "none"
-        )
+        return self.has_filters or self.dedup != "none"
 
     @property
     def effective_scale(self) -> int:
@@ -1046,7 +1280,19 @@ def _resolve_charset_option(args: argparse.Namespace) -> str:
             raise _CliError(
                 f"could not read --charset-file '{args.charset_file}': {exc}"
             ) from exc
-    return resolve_charset(args.charset if args.charset is not None else "lower")
+    spec = args.charset if args.charset is not None else "lower"
+    # A warning rather than an error: a raw charset is allowed to look like
+    # anything, so refusing would break legitimate values to catch a typo.
+    for part in spec.split(","):
+        stripped = part.strip()
+        suggestion = _mistyped_preset(stripped)
+        if suggestion is not None:
+            print(
+                f"Warning: --charset part '{stripped}' is not a preset, so it is "
+                f"being used as literal characters. Did you mean '{suggestion}'?",
+                file=sys.stderr,
+            )
+    return resolve_charset(spec)
 
 
 def _resolve_regex_option(args: argparse.Namespace) -> "re.Pattern[str] | None":
@@ -1147,7 +1393,7 @@ def _resolve_options(args: argparse.Namespace) -> _RunConfig:
                 f"Warning: pattern '{pattern}' has no wildcards; emitting as literal.",
                 file=sys.stderr,
             )
-        total_estimate += estimate_count(pattern, len(charset))
+        total_estimate += _count_from_kinds(kinds, len(charset))
 
     output_path = args.output
     # --count prints to stdout and never opens the output path, so validating
@@ -1236,7 +1482,10 @@ def _dedup_stage(words: Iterator[str], cfg: _RunConfig) -> Iterator[str]:
             file=sys.stderr,
         )
         return _deduplicated_approx(
-            words, _BloomFilter(cfg.dedup_capacity, cfg.dedup_error, _BLOOM_MAX_BYTES)
+            words,
+            _BloomFilter(
+                cfg.dedup_capacity, cfg.dedup_error, _BLOOM_MAX_BYTES, plan=plan
+            ),
         )
     if cfg.total_estimate > _DEDUP_WARN_THRESHOLD:
         print(
@@ -1265,7 +1514,7 @@ def _build_pipeline(
         for pattern in cfg.patterns:
             yield from _expand_pattern(pattern, cfg.charset)
 
-    source: Iterable[str] = expand()
+    source: Iterator[str] = expand()
     if should_stop is not None:
         source = _interruptible(source, should_stop)
 
@@ -1273,9 +1522,12 @@ def _build_pipeline(
     # the output is identical either way, but this keeps rejected candidates
     # out of the dedup set entirely -- its memory then tracks the output rather
     # than the whole pattern space, which is the tool's real scaling limit.
-    words = _dedup_stage(
-        _apply_filters(source, cfg.min_len, cfg.max_len, cfg.regex), cfg
-    )
+    #
+    # An unconfigured filter stage is not free: it is a generator resumed once
+    # per word, for three comparisons that can never reject one. Leave it out.
+    if cfg.has_filters:
+        source = _apply_filters(source, cfg.min_len, cfg.max_len, cfg.regex)
+    words = _dedup_stage(source, cfg)
     if cfg.limit is not None:
         return itertools.islice(words, cfg.limit)
     return words
@@ -1295,8 +1547,11 @@ def _make_progress(cfg: _RunConfig) -> _ProgressBar | None:
     except ImportError:
         return None
     # Without an exact count a bar could never reach 100%, so show a counter.
+    # disable=None is tqdm's own "only when my stream is a terminal" setting;
+    # it writes to stderr, so a redirected stderr collects redraw spam without
+    # it -- carriage returns and half-drawn bars in a log file.
     bar: _ProgressBar = tqdm_mod.tqdm(
-        total=cfg.exact_output_count, unit="words", desc="Generating"
+        total=cfg.exact_output_count, unit="words", desc="Generating", disable=None
     )
     return bar
 
@@ -1378,23 +1633,55 @@ def _write_to_file(
 
 
 def _detach_stdout() -> None:
-    """Point stdout at the null device after the reader has gone away.
+    """Point stdout at the null device once writing to it has failed.
 
-    Python flushes stdout again during interpreter shutdown; on a closed pipe
-    that raises a second BrokenPipeError and prints "Exception ignored" noise
-    after an otherwise ordinary `| head`.
+    A failed flush does not discard the buffer it could not write, and Python
+    flushes stdout once more during interpreter shutdown. That second attempt
+    runs outside every handler in this module, so it re-raises the same error
+    as "Exception ignored" noise and replaces the exit code with 120 --
+    silently, on a closed pipe; over the top of a reported error, on a failed
+    write. Redirecting the descriptor lets that last flush land in the void.
     """
-    with contextlib.suppress(OSError, ValueError):
+    # Best-effort cleanup on a path that is already failing: a stdout that
+    # cannot be detached (no fileno, or a closed one) must not raise over the
+    # error being reported. AttributeError covers a duck-typed stand-in with
+    # no fileno() at all; io.UnsupportedOperation is both OSError and
+    # ValueError, which covers the ones that have it but refuse to answer.
+    with contextlib.suppress(AttributeError, OSError, ValueError):
         devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, sys.stdout.fileno())
+        try:
+            os.dup2(devnull, sys.stdout.fileno())
+        finally:
+            # dup2 duplicates the description, so this end is surplus either
+            # way; closing it in a finally also covers a stdout with no fileno.
+            os.close(devnull)
+
+
+def _stdout_is_terminal() -> bool:
+    """Report whether stdout is a terminal, treating "cannot tell" as no.
+
+    A replaced stdout need not implement isatty(), and not being able to ask is
+    no reason to fail a run that is about to write plain text. Both callers
+    want the same fallback: chunk the stream, and allow binary output.
+
+    Returns:
+        True only when stdout is known to be a terminal.
+    """
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, OSError, ValueError):
+        return False
 
 
 def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
-    """Stream words to stdout, gzipped when asked.
+    """Stream words to stdout, with a progress bar where one helps.
 
-    Exit codes match the -o path: 130 when interrupted, 1 when the write
-    fails. A closed downstream pipe is the one success case -- `| head`
-    getting what it asked for is not an error.
+    A bar only earns its place when the words are going somewhere other than
+    the screen. At a terminal they are already scrolling past, and tqdm's
+    redraws would fight them for the same lines, so the bar is left off
+    entirely; _make_progress then drops it again if stderr is not a terminal.
+    That leaves it exactly where it is useful: `bitbrew ... > big.txt` with the
+    terminal free to show how far along the run is.
 
     Args:
         words: The finished word stream.
@@ -1403,11 +1690,53 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
     Returns:
         Process exit code.
     """
+    at_terminal = _stdout_is_terminal()
+    progress = None if at_terminal else _make_progress(cfg)
+    try:
+        return _stream_to_stdout(words, cfg, at_terminal, progress)
+    finally:
+        if progress is not None:
+            progress.close()
+
+
+def _stream_to_stdout(
+    words: Iterable[str],
+    cfg: _RunConfig,
+    at_terminal: bool,
+    progress: _ProgressBar | None,
+) -> int:
+    """Write the stream to stdout, gzipped when asked.
+
+    Exit codes match the -o path: 130 when interrupted, 1 when the write
+    fails. A closed downstream pipe is the one success case -- `| head`
+    getting what it asked for is not an error.
+
+    Every path flushes before returning. stdout is block-buffered when it is
+    not a terminal, so without an explicit flush the last partial buffer is
+    written during interpreter shutdown, outside every handler here: a failure
+    there escapes as "Exception ignored" noise and exit code 120 instead of the
+    code this function promises.
+
+    Args:
+        words: The finished word stream.
+        cfg: Resolved run configuration.
+        at_terminal: Whether stdout is a terminal, resolved once by the caller.
+        progress: Bar to advance, or None when one would not help.
+
+    Returns:
+        Process exit code.
+    """
     if not cfg.use_compress:
+        # print() per word costs about three times a joined write per chunk,
+        # and --chunk-size has always advertised itself as governing streaming
+        # output while reaching only the -o and --compress paths. At a terminal
+        # a person is reading along, so latency beats throughput and the chunk
+        # drops to a single line; a redirect or a pipe gets the full chunk.
+        chunk_size = 1 if at_terminal else cfg.chunk_size
         # BrokenPipeError subclasses OSError, so it has to be caught first.
         try:
-            for word in words:
-                print(word)
+            _chunked_write(words, sys.stdout, chunk_size, progress)
+            sys.stdout.flush()
         except BrokenPipeError:
             _detach_stdout()
             return 0
@@ -1416,11 +1745,12 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
             return 130
         except OSError as exc:
             print(f"Error: could not write to stdout: {exc}", file=sys.stderr)
+            _detach_stdout()
             return 1
         return 0
 
     # Gzip to stdout, but never at a terminal -- binary down a TTY is noise.
-    if sys.stdout.isatty():
+    if at_terminal:
         print(
             "Error: refusing to write compressed output to a terminal. "
             "Redirect it, pipe it, or use -o.",
@@ -1436,7 +1766,8 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
         return 1
     try:
         with gzip.GzipFile(fileobj=raw, mode="wb") as binary:
-            _chunked_write(words, binary, cfg.chunk_size)
+            _chunked_write(words, binary, cfg.chunk_size, progress)
+        raw.flush()
     except BrokenPipeError:
         _detach_stdout()
         return 0
@@ -1451,6 +1782,7 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
         return 130
     except OSError as exc:
         print(f"Error: could not write to stdout: {exc}", file=sys.stderr)
+        _detach_stdout()
         return 1
     return 0
 

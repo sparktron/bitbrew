@@ -118,6 +118,20 @@ bitbrew -p "**" --charset "aeiou0123"
 
 Duplicate characters in the resolved charset are automatically removed.
 
+Because an unrecognised name is taken as raw characters, a mistyped preset is otherwise
+silent — `--charset "lower,digts"` quietly generates a wordlist with no digits in it at
+all. bitbrew warns when a part looks like a preset it does not recognise, and names the
+one you probably meant. Deliberate raw charsets such as `abc` or `qwerty` resemble no
+preset and stay silent:
+
+```bash
+$ bitbrew -p "***" --charset "lower,digts"
+Warning: --charset part 'digts' is not a preset, so it is being used as literal
+characters. Did you mean 'digits'?
+```
+
+It is a warning, not a rejection — a raw charset is allowed to look like anything.
+
 **Commas and spaces** cannot be expressed through `--charset`, since it splits on commas
 and trims whitespace. Use `--charset-file` to supply a charset verbatim — every character
 in the file is used as-is, apart from a single trailing newline:
@@ -169,11 +183,17 @@ catastrophically turns a short run into an unbounded hang. bitbrew screens each 
 two ways before generating anything:
 
 1. **Structural check** — linearly scans for nested quantifiers such as `(a+)+` or
-   `(\d+)+`, while treating escapes and character-class contents as literals.
+   `(\d+)+`, while treating escapes and character-class contents as literals. A
+   repetition written as a range brace counts on either side of the nesting, so
+   `(a{1,3})+` and `(a+){2,}` are caught too. A fixed count is not a range and is left
+   alone: `(a{3})+` has no alternative lengths to backtrack over.
 2. **Timing probe** — matches the regex against a short ladder of adversarial inputs built
    from the pattern's own alphabet and rejects it if the time grows exponentially. This
    catches the overlapping-alternation family, like `(a|a)+$` and `(a|b|ab)*$`, that no
-   structural check sees.
+   structural check sees. The alphabet is what the pattern *matches*, not the characters
+   of its source: `\s` contributes a space, `\d` a digit, and literal punctuation counts,
+   so `(\s|\s)+$` is probed with whitespace rather than with the letter `s` it can never
+   consume.
 
 The probe costs well under a millisecond for a normal filter and stops after a match pushes
 its cumulative work over the time budget. The structural pass itself is linear, including
@@ -186,7 +206,7 @@ indicates catastrophic backtracking (ReDoS). Use --allow-unsafe-regex to run it 
 ```
 
 > ⚠️ Screening is a **heuristic, not a guarantee**. It can miss a pathological pattern
-> whose trigger does not resemble its own literals, and the structural check still rejects
+> whose trigger does not resemble anything it mentions, and the structural check still rejects
 > a few safe patterns such as `(ab+c)+`. Override it with `--allow-unsafe-regex` when you
 > know a filter is fine — and do not treat it as a security boundary for regexes that come
 > from somewhere you do not trust.
@@ -298,19 +318,34 @@ Check the size before you commit to it — `--count` and the `--force` warning b
 what you are about to generate. Each extra `*` multiplies the output by the charset size:
 `-p "******"` over `lower` is 308 million words and roughly 2 GB of text.
 
-Control the streaming buffer size with `--chunk-size` (default: 10,000 words):
+Control the streaming buffer size with `--chunk-size` (default: 10,000 words). It applies
+to every destination — a file, gzip, or stdout:
 
 ```bash
 bitbrew -p "*****" --charset lower --force -o big.txt --chunk-size 50000
 ```
 
-**Optional progress bar** — install `tqdm` and bitbrew will display a live progress counter automatically when writing to a file:
+Streaming to a **terminal** ignores the chunk size and writes one line at a time, so output
+appears as it is generated rather than in bursts. Redirect or pipe the stream and the full
+chunk applies.
+
+**Optional progress bar** — install `tqdm` and bitbrew will display a live progress
+counter on stderr, both when writing to a file and when the stdout stream is redirected
+or piped:
 
 ```bash
 pip install tqdm
 bitbrew -p "*****" --charset lower --force -o big.txt
 # Generating: 100%|████████████| 11.9M/11.9M [00:04<00:00, 2.54Mwords/s]
+
+bitbrew -p "*****" --charset lower --force > big.txt
+# Generating: 100%|████████████| 11.9M/11.9M [00:02<00:00, 6.31Mwords/s]
 ```
+
+The bar appears only where it helps. Streaming to a **terminal** shows none: the words
+are already scrolling past, and the redraws would fight them for the same lines. A
+**redirected stderr** shows none either, so a log file collects the summary rather than
+a few thousand carriage returns.
 
 When `--min-len`, `--max-len`, `--filter`, or deduplication are in play the final count
 is not knowable up front, so bitbrew shows a plain counter instead of a percentage bar

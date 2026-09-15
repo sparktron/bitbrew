@@ -4,6 +4,7 @@ import errno
 import gzip
 import importlib.metadata
 import io
+import itertools
 import os
 import re
 import shutil
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import time
 import types
+from collections.abc import Generator
 from unittest import mock
 
 import pytest
@@ -21,6 +23,7 @@ import bitbrew
 from bitbrew import (
     _BLOOM_MAX_BYTES,
     _MAX_ESTIMATE,
+    CHARSETS,
     _apply_filters,
     _BloomFilter,
     _check_regex_safety,
@@ -173,6 +176,34 @@ class TestCheckRegexSafety:
     def test_literal_quantifier_characters_are_allowed(self, pattern: str) -> None:
         """Escaped and character-class metacharacters are not repetitions."""
         assert _check_regex_safety(pattern) is None
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [r"(a{1,3})+$", r"(a{2,})+$", r"(a+){2,}$", r"([a-z]{2,3})+$", r"(a{1,2}){3,}"],
+    )
+    def test_range_brace_quantifiers_are_repetitions(self, pattern: str) -> None:
+        """A range brace backtracks like "*", on either side of the nesting.
+
+        These used to pass the structural check and fall through to the timing
+        probe, which spends ~100 ms per pattern to reach a vaguer verdict.
+        """
+        result = _check_regex_safety(pattern)
+        assert result is not None, f"should be rejected: {pattern}"
+        assert "nested quantifiers" in result
+
+    @pytest.mark.parametrize("pattern", [r"(a{3})+", r"(\d{4})+", r"(a{,})+", r"(a{})+"])
+    def test_fixed_and_literal_braces_are_not_repetitions(self, pattern: str) -> None:
+        """A fixed count has no alternative lengths, so it cannot blow up.
+
+        "{,}" and "{}" are literal characters to Python's engine, not
+        quantifiers at all. Rejecting these would be a false positive.
+        """
+        assert _check_regex_safety(pattern) is None
+
+    def test_brace_screening_agrees_with_the_timing_probe(self) -> None:
+        """The structural verdict must match what matching actually does."""
+        assert _probe_regex_blowup(re.compile(r"(a{1,3})+$"), r"(a{1,3})+$") is not None
+        assert _probe_regex_blowup(re.compile(r"(a{3})+$"), r"(a{3})+$") is None
 
     def test_structural_check_is_linear_on_malformed_class(self) -> None:
         """Malformed input must reach re.compile without detector backtracking."""
@@ -1044,13 +1075,21 @@ class TestProgressTotal:
         assert _FakeTqdm.last["total"] is None
 
     def test_saturated_estimate_gets_no_total(self, tmp_path: "os.PathLike[str]") -> None:
-        """A capped estimate is not a real number; show a counter instead."""
+        """A capped estimate is not a real number; show a counter instead.
+
+        The cap is reached for real rather than mocked: 70**16 combinations
+        saturate _MAX_ESTIMATE, and the estimate is arithmetic, so asking for
+        it costs nothing. _chunked_write is stubbed so the lazy pipeline is
+        never actually walked.
+        """
         out = os.path.join(str(tmp_path), "w.txt")
-        with (
-            mock.patch("bitbrew.estimate_count", return_value=_MAX_ESTIMATE),
-            mock.patch("bitbrew._chunked_write", return_value=0),
-        ):
-            assert main(["-p", "a*", "--charset", "xy", "-o", out, "--force"]) == 0
+        pattern = "*" * 16
+        with mock.patch("bitbrew._chunked_write", return_value=0):
+            assert main(
+                ["-p", pattern, "--charset", "all", "-o", out, "--force"]
+            ) == 0
+
+        assert estimate_count(pattern, len(resolve_charset("all"))) == _MAX_ESTIMATE
         assert _FakeTqdm.last["total"] is None
 
 
@@ -1123,6 +1162,49 @@ class TestPatternEscapes:
         ret = main(["-p", r"\*\?", "--charset", "xy"])
         assert ret == 0
         assert "no wildcards" in capsys.readouterr().err
+
+
+class TestParsePatternShape:
+    """_parse_pattern's literal runs line up one-to-one with the wildcards."""
+
+    @pytest.mark.parametrize(
+        ("pattern", "literals", "kinds"),
+        [
+            ("hello", ["hello"], []),
+            ("", [""], []),
+            ("*", ["", ""], ["*"]),
+            ("a*b", ["a", "b"], ["*"]),
+            ("**", ["", "", ""], ["*", "*"]),
+            ("a*b?c", ["a", "b", "c"], ["*", "?"]),
+            ("*ab*", ["", "ab", ""], ["*", "*"]),
+            (r"a\*b*", ["a*b", ""], ["*"]),
+        ],
+    )
+    def test_literals_have_one_more_entry_than_kinds(
+        self, pattern: str, literals: list[str], kinds: list[str]
+    ) -> None:
+        """Empty runs are kept so literals[i] always precedes wildcard i."""
+        assert _parse_pattern(pattern) == (literals, kinds)
+
+    @pytest.mark.parametrize(
+        "pattern", ["hello", "*", "a*b", "**", "a*b?c", "*ab*", "?", "??x"]
+    )
+    def test_reassembly_matches_expansion(self, pattern: str) -> None:
+        """literals[0] + choice[0] + ... must rebuild every generated word."""
+        literals, kinds = _parse_pattern(pattern)
+        assert len(literals) == len(kinds) + 1
+
+        chars = "ab"
+        options = [list(chars) if k == "*" else ["", *chars] for k in kinds]
+        expected = [
+            "".join(
+                part
+                for pair in zip(literals, [*combo, ""], strict=True)
+                for part in pair
+            )
+            for combo in itertools.product(*options)
+        ]
+        assert list(_expand_pattern(pattern, chars)) == expected
 
 
 class TestCharsetFile:
@@ -1763,7 +1845,11 @@ class TestSidecarCreation:
             with pytest.raises(OSError) as excinfo:
                 bitbrew._create_sidecar(outfile)
 
-        assert excinfo.value.errno == errno.EEXIST
+        # Exhaustion reports no errno on purpose: errno.EEXIST would build a
+        # FileExistsError, which _write_to_file reads as "the output path is
+        # taken" and answers with a --overwrite hint that cannot help.
+        assert not isinstance(excinfo.value, FileExistsError)
+        assert "unused sidecar name" in str(excinfo.value)
         with open(path, encoding="utf-8") as existing:
             assert existing.read() == "irreplaceable"
 
@@ -2013,3 +2099,599 @@ class TestFallbackPublishesNothingEmpty:
         assert "Wrote" in capsys.readouterr().err
         with open(outfile, encoding="utf-8") as handle:
             assert sorted(handle.read().split()) == ["ax", "ay"]
+
+
+class TestStdoutBufferFlush:
+    """The last partial stdout buffer must be flushed inside the handlers.
+
+    stdout is block-buffered when it is not a terminal, so a short run's
+    output never reaches the descriptor until interpreter shutdown -- past
+    every handler in _write_to_stdout. Failures there used to escape as an
+    "Exception ignored" traceback and exit code 120, so the documented codes
+    only ever held for runs large enough to fill an 8 KiB buffer on the way.
+
+    These run real subprocesses: pytest's capture replaces sys.stdout with an
+    unbuffered object, which is precisely the condition that hides the bug.
+    """
+
+    @staticmethod
+    def _run(args: list[str], stdout: object) -> "subprocess.CompletedProcess[str]":
+        """Run bitbrew with stdout buffered as it would be under a redirect."""
+        env = dict(os.environ)
+        env.pop("PYTHONUNBUFFERED", None)
+        return subprocess.run(
+            [sys.executable, BITBREW_PY, *args],
+            stdout=stdout,  # type: ignore[arg-type]
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            env=env,
+            check=False,
+        )
+
+    @pytest.mark.skipif(
+        not os.path.exists("/dev/full"), reason="needs /dev/full to fail a write"
+    )
+    @pytest.mark.parametrize("extra", [[], ["--compress"]])
+    def test_short_failed_write_reports_one_and_stays_quiet(
+        self, extra: list[str]
+    ) -> None:
+        """A two-word run onto a full device is exit 1, not a shutdown traceback."""
+        with open("/dev/full", "w") as full:
+            result = self._run(["-p", "a*", "--charset", "xy", *extra], full)
+
+        assert result.returncode == 1, result.stderr
+        assert "could not write to stdout" in result.stderr
+        assert "Exception ignored" not in result.stderr
+        assert "Traceback" not in result.stderr
+
+    def test_short_output_into_a_closed_pipe_is_silent(self) -> None:
+        """`| head` on a run too small to fill the buffer is still exit 0.
+
+        The existing broken-pipe test generates 11.8M words, which fills the
+        buffer long before the reader goes away; the failure then surfaces
+        inside the write loop. A short run only fails at shutdown.
+        """
+        env = dict(os.environ)
+        env.pop("PYTHONUNBUFFERED", None)
+        writer = subprocess.Popen(
+            [sys.executable, BITBREW_PY, "-p", "a*", "--charset", "xy"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        assert writer.stdout is not None
+        writer.stdout.close()
+        _, stderr = writer.communicate(timeout=60)
+
+        assert writer.returncode == 0
+        assert "Exception ignored" not in stderr
+        assert "BrokenPipeError" not in stderr
+
+
+class TestDetachStdout:
+    """Redirecting stdout to the null device must not leak the descriptor."""
+
+    def test_devnull_descriptor_is_closed(self) -> None:
+        """dup2 duplicates the description, so the opened end is surplus."""
+        opened: list[int] = []
+        closed: list[int] = []
+        real_open, real_close = os.open, os.close
+
+        def spy_open(path: str, flags: int, *rest: int) -> int:
+            fd = real_open(path, flags, *rest)
+            opened.append(fd)
+            return fd
+
+        with mock.patch.object(os, "open", spy_open), \
+             mock.patch.object(os, "close", lambda fd: (closed.append(fd), real_close(fd))), \
+             mock.patch.object(os, "dup2", lambda *a, **k: None):
+            bitbrew._detach_stdout()
+
+        assert opened, "expected the null device to be opened"
+        assert closed == opened
+
+    @pytest.mark.parametrize("stdout_factory", ["refuses", "missing"])
+    def test_descriptor_is_closed_without_a_usable_fileno(
+        self, stdout_factory: str
+    ) -> None:
+        """A stdout that cannot be detached must not leak, nor raise.
+
+        This runs on a path that is already reporting a failure, so an
+        AttributeError from a duck-typed stand-in with no fileno() at all
+        would land on top of the error the user actually needs to read.
+        """
+        closed: list[int] = []
+        real_close = os.close
+
+        class RefusesFileno:
+            def fileno(self) -> int:
+                raise io.UnsupportedOperation("no fileno")
+
+        class MissingFileno:
+            """A stdout stand-in with no fileno() attribute whatsoever."""
+
+        fake = RefusesFileno() if stdout_factory == "refuses" else MissingFileno()
+        with mock.patch.object(sys, "stdout", fake), \
+             mock.patch.object(os, "close", lambda fd: (closed.append(fd), real_close(fd))):
+            bitbrew._detach_stdout()
+
+        assert len(closed) == 1
+
+
+class TestSidecarExhaustion:
+    """Running out of sidecar names is not "the output path is taken"."""
+
+    def test_exhaustion_is_not_a_file_exists_error(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """OSError maps errno.EEXIST to FileExistsError, which misreads here."""
+        target = os.path.join(str(tmp_path), "out.txt")
+        with (
+            mock.patch("os.open", side_effect=FileExistsError()),
+            pytest.raises(OSError) as caught,
+        ):
+            bitbrew._create_sidecar(target)
+
+        assert not isinstance(caught.value, FileExistsError)
+        assert "unused sidecar name" in str(caught.value)
+
+    def test_cli_does_not_blame_the_output_path(
+        self, tmp_path: "os.PathLike[str]", capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--overwrite cannot help here, so the error must not suggest it."""
+        target = os.path.join(str(tmp_path), "out.txt")
+        with mock.patch(
+            "bitbrew._create_sidecar",
+            side_effect=OSError("could not find an unused sidecar name"),
+        ):
+            ret = main(["-p", "a*", "--charset", "xy", "-o", target])
+
+        assert ret == 1
+        stderr = capsys.readouterr().err
+        assert "unused sidecar name" in stderr
+        assert "already exists" not in stderr
+        assert "--overwrite" not in stderr
+
+
+class _RecordingStdout:
+    """A non-tty stdout stand-in that records each write call."""
+
+    def __init__(self, tty: bool = False) -> None:
+        self.writes: list[str] = []
+        self._tty = tty
+
+    def write(self, data: str) -> int:
+        self.writes.append(data)
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+class TestStdoutChunking:
+    """--chunk-size governs the stdout stream, as its help text says.
+
+    It previously reached only the -o and --compress paths; plain stdout
+    wrote one print() per word regardless.
+    """
+
+    def test_chunk_size_governs_stdout_writes(self) -> None:
+        """25 words at --chunk-size 10 is three writes, not twenty-five."""
+        fake = _RecordingStdout()
+        with mock.patch.object(sys, "stdout", fake):
+            ret = main(["-p", "**", "--charset", "abcde", "--chunk-size", "10"])
+
+        assert ret == 0
+        assert len(fake.writes) == 3
+        assert "".join(fake.writes) == "".join(
+            f"{a}{b}\n" for a in "abcde" for b in "abcde"
+        )
+
+    def test_a_terminal_still_gets_one_line_at_a_time(self) -> None:
+        """At a tty a person is reading along, so latency beats throughput."""
+        fake = _RecordingStdout(tty=True)
+        with mock.patch.object(sys, "stdout", fake):
+            ret = main(["-p", "a*", "--charset", "abc"])
+
+        assert ret == 0
+        assert fake.writes == ["aa\n", "ab\n", "ac\n"]
+
+    def test_output_text_is_unchanged_by_chunking(self) -> None:
+        """Whatever the chunk size, the bytes on the stream are the same."""
+        rendered = set()
+        for chunk_size in ("1", "3", "7", "10000"):
+            fake = _RecordingStdout()
+            with mock.patch.object(sys, "stdout", fake):
+                assert main(["-p", "a*", "--charset", "xyz",
+                             "--chunk-size", chunk_size]) == 0
+            rendered.add("".join(fake.writes))
+
+        assert rendered == {"ax\nay\naz\n"}
+
+
+class TestChunkedWritePolling:
+    """A large --chunk-size must not stretch the gap between stop polls."""
+
+    def test_block_is_capped_while_a_stop_predicate_is_installed(self) -> None:
+        """Polling every 10k words is what keeps Ctrl-C responsive."""
+        polls = 0
+
+        def should_stop() -> bool:
+            nonlocal polls
+            polls += 1
+            return False
+
+        buf = io.StringIO()
+        total = _chunked_write(
+            [f"w{i}" for i in range(25_000)], buf,
+            chunk_size=1_000_000, should_stop=should_stop,
+        )
+
+        assert total == 25_000
+        # 25k words at a 10k cap: three chunks, plus the poll on the last one.
+        assert polls == 3
+
+    def test_no_predicate_uses_the_requested_chunk_size(self) -> None:
+        """Without a poll to pace, the full chunk is written in one go."""
+        buf = io.StringIO()
+        writes: list[str] = []
+        with mock.patch.object(
+            buf, "write", lambda data: (writes.append(data), len(data))[1]
+        ):
+            total = _chunked_write(
+                [f"w{i}" for i in range(25_000)], buf, chunk_size=1_000_000
+            )
+
+        assert total == 25_000
+        assert len(writes) == 1
+
+
+class TestFilterStageBypass:
+    """An unconfigured filter stage is a generator resumed once per word."""
+
+    @staticmethod
+    def _cfg(argv: list[str]) -> bitbrew._RunConfig:
+        return _resolve_options(build_parser().parse_args(argv))
+
+    def test_has_filters_tracks_the_configured_options(self) -> None:
+        base = ["-p", "a*", "--charset", "xy"]
+        assert not self._cfg(base).has_filters
+        assert self._cfg([*base, "--min-len", "1"]).has_filters
+        assert self._cfg([*base, "--max-len", "9"]).has_filters
+        assert self._cfg([*base, "--filter", "a"]).has_filters
+
+    def test_discards_candidates_still_counts_dedup(self) -> None:
+        """The --force guard depends on this staying true for dedup alone."""
+        cfg = self._cfg(["-p", "a?", "-p", "b*", "--charset", "xy"])
+        assert not cfg.has_filters
+        assert cfg.discards_candidates
+
+    def test_bypassing_the_stage_does_not_change_the_stream(self) -> None:
+        """The unfiltered pipeline must emit exactly what filtering allowed."""
+        unfiltered = list(bitbrew._build_pipeline(self._cfg(["-p", "a*", "--charset", "xyz"])))
+        permissive = list(
+            bitbrew._build_pipeline(
+                self._cfg(["-p", "a*", "--charset", "xyz", "--min-len", "0"])
+            )
+        )
+        assert unfiltered == permissive == ["ax", "ay", "az"]
+
+
+class TestBloomProbeScheme:
+    """add_if_absent inlines _positions, so the two must not drift apart."""
+
+    def test_inlined_probe_walk_matches_the_definition(self) -> None:
+        """Stepping by `second` must reproduce (first + probe * second)."""
+        reference = _BloomFilter(5_000, 1e-3, _BLOOM_MAX_BYTES)
+        inlined = _BloomFilter(5_000, 1e-3, _BLOOM_MAX_BYTES)
+        assert reference.hash_count > 1, "a one-probe filter would not test this"
+
+        for word in (f"w{i}" for i in range(5_000)):
+            # Set the reference's bits straight from _positions.
+            expected_new = False
+            for position in reference._positions(word):
+                index, mask = position >> 3, 1 << (position & 7)
+                if not reference._array[index] & mask:
+                    expected_new = True
+                    reference._array[index] |= mask
+            assert inlined.add_if_absent(word) is expected_new
+
+        assert inlined._array == reference._array
+
+    def test_probably_contains_agrees_with_add_if_absent(self) -> None:
+        """The query path and the recording path share one probe scheme."""
+        bloom = _BloomFilter(2_000, 1e-3, _BLOOM_MAX_BYTES)
+        added = [f"added{i}" for i in range(2_000)]
+        for word in added:
+            bloom.add_if_absent(word)
+
+        assert all(bloom.probably_contains(word) for word in added)
+        assert not bloom.add_if_absent(added[0])
+
+    def test_allocated_filter_uses_the_plan_that_was_reported(self) -> None:
+        """The cost printed before allocating must be the cost allocated."""
+        plan = _plan_bloom(10_000, 1e-4, _BLOOM_MAX_BYTES)
+        bloom = _BloomFilter(10_000, 1e-4, _BLOOM_MAX_BYTES, plan=plan)
+
+        assert bloom.plan is plan
+        assert bloom.size_bytes == plan.size_bytes
+        assert bloom.hash_count == plan.hash_count
+        assert bloom.expected_error_rate == plan.error_rate
+
+
+class TestStdoutTerminalDetection:
+    """A replaced stdout need not answer isatty(); that must not fail a run."""
+
+    @pytest.mark.parametrize("broken", [AttributeError, ValueError, OSError])
+    def test_unanswerable_stdout_is_treated_as_not_a_terminal(
+        self, broken: type[BaseException]
+    ) -> None:
+        """Chunking the stream and allowing binary are the safe fallbacks."""
+
+        class Unanswerable:
+            def isatty(self) -> bool:
+                raise broken("no")
+
+        with mock.patch.object(sys, "stdout", Unanswerable()):
+            assert bitbrew._stdout_is_terminal() is False
+
+    def test_stdout_without_isatty_still_writes(self) -> None:
+        """A minimal stand-in with only write() must still work end to end."""
+
+        class Minimal:
+            def __init__(self) -> None:
+                self.data = ""
+
+            def write(self, data: str) -> int:
+                self.data += data
+                return len(data)
+
+            def flush(self) -> None:
+                pass
+
+        fake = Minimal()
+        with mock.patch.object(sys, "stdout", fake):
+            ret = main(["-p", "a*", "--charset", "xy"])
+
+        assert ret == 0
+        assert fake.data == "ax\nay\n"
+
+
+class TestProbeSeedSelection:
+    """Probe material must be something the pattern can actually consume.
+
+    Seeds were scanned off the source text with [A-Za-z0-9], so "\\s" seeded
+    the letter "s" -- which "\\s" never matches. Every probe string was then
+    rejected on its first character and the pattern was reported fast and
+    safe. Combined with the structural check's blindness to overlapping
+    alternation, that left "(\\s|\\s)+$" passing both layers.
+    """
+
+    @pytest.mark.parametrize(
+        ("pattern", "expected"),
+        [
+            (r"\s", " "), (r"\d", "0"), (r"\w", "a"), (r"\W", " "),
+            (r"\.", "."), (r"\\", "\\"),
+        ],
+    )
+    def test_escapes_seed_a_character_they_match(
+        self, pattern: str, expected: str
+    ) -> None:
+        """A shorthand class resolves to a member, not to its own letter."""
+        assert bitbrew._probe_seeds(pattern) == [expected]
+        if expected.isalnum():
+            return
+        compiled = re.compile(pattern)
+        assert compiled.match(expected), f"{pattern} should match {expected!r}"
+
+    def test_literal_punctuation_is_usable_probe_material(self) -> None:
+        """Only letters and digits counted before, so " " was never a seed."""
+        assert bitbrew._probe_seeds(r"( | )+$") == [" "]
+        assert bitbrew._probe_seeds(r"(-|-)+$") == ["-"]
+
+    def test_character_class_members_are_collected(self) -> None:
+        """Range endpoints are members; "-" itself spells the range."""
+        assert bitbrew._probe_seeds(r"[a-z]+") == ["a", "z", "az"]
+        assert bitbrew._probe_seeds(r"[\s]+") == [" "]
+
+    def test_negated_class_falls_back_rather_than_seeding_non_members(self) -> None:
+        """A negated class lists exactly what it cannot match."""
+        assert bitbrew._probe_seeds(r'([^"]*)*$') == ["a"]
+        assert re.compile(r"[^\"]").match("a")
+
+    def test_repetition_material_survives_the_seed_cap(self) -> None:
+        """A quantified group must contribute seeds before leading literals do.
+
+        The cap applied in source order let four leading escapes spend every
+        slot before the scan reached the group that actually blows up, so
+        this pattern passed both screening layers while being exponential on
+        repeated "d" (106 ms at 18 characters, 1.7 s at 22).
+        """
+        pattern = r"\s?\d?\w?\D?(d|d)+$"
+        assert bitbrew._probe_seeds(pattern)[0] == "d"
+        assert _check_regex_safety(pattern) is None, "structural check is blind here"
+        assert _probe_regex_blowup(re.compile(pattern), pattern) is not None
+
+    @pytest.mark.parametrize(
+        ("pattern", "first"),
+        [(r"pass\d+", "0"), (r"[a-z]+", "a"), (r"abc(xy|xy)*$", "x"),
+         (r"ab(q|q){2,}$", "q")],
+    )
+    def test_quantified_material_is_tried_first(self, pattern: str, first: str) -> None:
+        """Backtracking is driven by what a repetition can consume."""
+        assert bitbrew._probe_seeds(pattern)[0] == first
+
+    def test_unbalanced_group_still_yields_seeds(self) -> None:
+        """An unclosed "(" is a syntax error, but must not lose its characters."""
+        assert "q" in bitbrew._probe_seeds(r"(q")
+
+    def test_seed_count_stays_capped(self) -> None:
+        """More seeds means more probing, and screening must stay cheap."""
+        seeds = bitbrew._probe_seeds(r"abcdefghij")
+        assert len(seeds) == bitbrew._PROBE_MAX_SEEDS + 1  # +1 for the pair
+
+    @pytest.mark.parametrize("pattern", [r"(\s|\s)+$", r"(\d|\d)+$", r"( | )+$"])
+    def test_class_based_alternation_redos_is_now_probed_out(
+        self, pattern: str
+    ) -> None:
+        """These are exponential, and the structural check does not see them."""
+        assert _check_regex_safety(pattern) is None, "structural check is blind here"
+        assert _probe_regex_blowup(re.compile(pattern), pattern) is not None
+
+    @pytest.mark.parametrize(
+        "pattern", [r"\s+", r"[ \t]+", r"\d{2,4}", r"^\w+@\w+\.\w+$", r"a - b"]
+    )
+    def test_safe_whitespace_patterns_are_not_false_positives(
+        self, pattern: str
+    ) -> None:
+        """Richer seeds must not start rejecting ordinary filters."""
+        assert _probe_regex_blowup(re.compile(pattern), pattern) is None
+
+    def test_cli_refuses_whitespace_alternation_redos(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """End to end: a filter that would hang the run is refused."""
+        ret = main(["-p", "a*", "--charset", "ab", "--filter", r"(\s|\s)+$"])
+
+        assert ret == 1
+        stderr = capsys.readouterr().err
+        assert "unsafe regex" in stderr
+        assert "backtracking" in stderr
+
+
+class TestMistypedCharsetPreset:
+    """An unknown --charset part is literal characters, which hides typos."""
+
+    @pytest.mark.parametrize(
+        ("part", "meant"),
+        [("digts", "digits"), ("digit", "digits"), ("lowe", "lower"),
+         ("lowercase", "lower"), ("uppercase", "upper"), ("symbol", "symbols"),
+         ("ALL", "all"), ("Digits", "digits")],
+    )
+    def test_typos_are_matched_to_a_preset(self, part: str, meant: str) -> None:
+        assert bitbrew._mistyped_preset(part) == meant
+
+    @pytest.mark.parametrize(
+        "part",
+        ["abc", "xyz", "abc123", "aeiou", "qwerty", "hex", "0123456789abcdef",
+         "!@#$", "ab", "a", "zzz", "vowels", "cba", "pass", "admin", "root"],
+    )
+    def test_deliberate_raw_charsets_are_not_flagged(self, part: str) -> None:
+        """A raw charset may look like anything; false positives are worse."""
+        assert bitbrew._mistyped_preset(part) is None
+
+    @pytest.mark.parametrize("part", ["lower", "upper", "digits", "symbols", "all"])
+    def test_real_presets_are_not_flagged(self, part: str) -> None:
+        assert bitbrew._mistyped_preset(part) is None
+
+    def test_cli_warns_and_names_the_preset(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """'lower,digts' silently drops every digit; say so."""
+        ret = main(["-p", "*", "--charset", "lower,digts", "--count"])
+
+        assert ret == 0
+        stderr = capsys.readouterr().err
+        assert "'digts' is not a preset" in stderr
+        assert "Did you mean 'digits'?" in stderr
+
+    def test_warning_does_not_change_the_charset(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """It is a warning, not a rejection: the run proceeds unchanged."""
+        ret = main(["-p", "*", "--charset", "lower,digts", "--count"])
+        capsys.readouterr()
+
+        assert ret == 0
+        # 26 lowercase plus d, i, g, t, s -- all already in lower -> 26.
+        assert resolve_charset("lower,digts") == CHARSETS["lower"]
+
+    def test_legitimate_charsets_stay_silent(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        for spec in ("abc", "qwerty", "lower,digits", "!@#", "aeiou"):
+            assert main(["-p", "*", "--charset", spec, "--count"]) == 0
+            assert "not a preset" not in capsys.readouterr().err, spec
+
+    def test_charset_file_is_not_screened(
+        self, tmp_path: "os.PathLike[str]", capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--charset-file is verbatim by design, typo-shaped or not."""
+        path = os.path.join(str(tmp_path), "cs.txt")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("digts")
+
+        assert main(["-p", "*", "--charset-file", path, "--count"]) == 0
+        assert "not a preset" not in capsys.readouterr().err
+
+
+class TestStdoutProgressBar:
+    """A bar helps only when the words are going somewhere other than the screen."""
+
+    @pytest.fixture(autouse=True)
+    def _fake_tqdm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setitem(sys.modules, "tqdm", types.SimpleNamespace(tqdm=_FakeTqdm))
+        _FakeTqdm.last = {}
+
+    def test_make_progress_lets_tqdm_drop_a_non_terminal_stream(self) -> None:
+        """disable=None is tqdm's own "only when my stream is a terminal"."""
+        cfg = _resolve_options(build_parser().parse_args(["-p", "a*", "--charset", "xy"]))
+        assert bitbrew._make_progress(cfg) is not None
+        assert _FakeTqdm.last["disable"] is None
+
+    def test_redirected_stdout_gets_a_bar(self) -> None:
+        """The useful case: `bitbrew ... > big.txt` with the terminal free."""
+        fake = _RecordingStdout(tty=False)
+        with mock.patch.object(sys, "stdout", fake):
+            assert main(["-p", "a*", "--charset", "xyz"]) == 0
+
+        assert _FakeTqdm.last.get("total") == 3
+
+    def test_terminal_stdout_gets_no_bar(self) -> None:
+        """Words are already scrolling past; redraws would fight them."""
+        fake = _RecordingStdout(tty=True)
+        with mock.patch.object(sys, "stdout", fake):
+            assert main(["-p", "a*", "--charset", "xyz"]) == 0
+
+        assert _FakeTqdm.last == {}
+
+    def test_bar_advances_by_the_words_written(self) -> None:
+        """The counter must track output, not be created and left at zero."""
+        seen: list[int] = []
+
+        class CountingTqdm(_FakeTqdm):
+            def update(self, n: int) -> None:
+                seen.append(n)
+
+        with mock.patch.dict(
+            sys.modules, {"tqdm": types.SimpleNamespace(tqdm=CountingTqdm)}
+        ), mock.patch.object(sys, "stdout", _RecordingStdout(tty=False)):
+            assert main(["-p", "**", "--charset", "abc", "--chunk-size", "4"]) == 0
+
+        assert sum(seen) == 9
+
+    @pytest.mark.parametrize(
+        "failure", [KeyboardInterrupt(), BrokenPipeError(), OSError(errno.ENOSPC, "full")]
+    )
+    def test_bar_is_closed_on_every_exit_path(self, failure: BaseException) -> None:
+        """A bar left open would keep its last redraw on the terminal."""
+        closed: list[bool] = []
+
+        class ClosingTqdm(_FakeTqdm):
+            def close(self) -> None:
+                closed.append(True)
+
+        def fake_pipeline(cfg: object, should_stop: object = None) -> "Generator[str, None, None]":
+            yield "aa"
+            raise failure
+
+        with mock.patch.dict(
+            sys.modules, {"tqdm": types.SimpleNamespace(tqdm=ClosingTqdm)}
+        ), mock.patch("bitbrew._build_pipeline", side_effect=fake_pipeline), \
+             mock.patch.object(sys, "stdout", _RecordingStdout(tty=False)), \
+             mock.patch("bitbrew._detach_stdout"):
+            main(["-p", "a*", "--charset", "xy"])
+
+        assert closed == [True]
