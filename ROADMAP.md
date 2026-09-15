@@ -23,6 +23,8 @@
   characters of its source, so class-based alternation such as `(\s|\s)+$` is screened.
 - Warn when a `--charset` part looks like a mistyped preset instead of silently using it
   as literal characters.
+- Show the progress bar for redirected stdout runs, and keep it off a terminal and out of
+  a redirected stderr.
 
 ## Next
 

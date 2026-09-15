@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import types
+from collections.abc import Generator
 from unittest import mock
 
 import pytest
@@ -2598,3 +2599,73 @@ class TestMistypedCharsetPreset:
 
         assert main(["-p", "*", "--charset-file", path, "--count"]) == 0
         assert "not a preset" not in capsys.readouterr().err
+
+
+class TestStdoutProgressBar:
+    """A bar helps only when the words are going somewhere other than the screen."""
+
+    @pytest.fixture(autouse=True)
+    def _fake_tqdm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setitem(sys.modules, "tqdm", types.SimpleNamespace(tqdm=_FakeTqdm))
+        _FakeTqdm.last = {}
+
+    def test_make_progress_lets_tqdm_drop_a_non_terminal_stream(self) -> None:
+        """disable=None is tqdm's own "only when my stream is a terminal"."""
+        cfg = _resolve_options(build_parser().parse_args(["-p", "a*", "--charset", "xy"]))
+        assert bitbrew._make_progress(cfg) is not None
+        assert _FakeTqdm.last["disable"] is None
+
+    def test_redirected_stdout_gets_a_bar(self) -> None:
+        """The useful case: `bitbrew ... > big.txt` with the terminal free."""
+        fake = _RecordingStdout(tty=False)
+        with mock.patch.object(sys, "stdout", fake):
+            assert main(["-p", "a*", "--charset", "xyz"]) == 0
+
+        assert _FakeTqdm.last.get("total") == 3
+
+    def test_terminal_stdout_gets_no_bar(self) -> None:
+        """Words are already scrolling past; redraws would fight them."""
+        fake = _RecordingStdout(tty=True)
+        with mock.patch.object(sys, "stdout", fake):
+            assert main(["-p", "a*", "--charset", "xyz"]) == 0
+
+        assert _FakeTqdm.last == {}
+
+    def test_bar_advances_by_the_words_written(self) -> None:
+        """The counter must track output, not be created and left at zero."""
+        seen: list[int] = []
+
+        class CountingTqdm(_FakeTqdm):
+            def update(self, n: int) -> None:
+                seen.append(n)
+
+        with mock.patch.dict(
+            sys.modules, {"tqdm": types.SimpleNamespace(tqdm=CountingTqdm)}
+        ), mock.patch.object(sys, "stdout", _RecordingStdout(tty=False)):
+            assert main(["-p", "**", "--charset", "abc", "--chunk-size", "4"]) == 0
+
+        assert sum(seen) == 9
+
+    @pytest.mark.parametrize(
+        "failure", [KeyboardInterrupt(), BrokenPipeError(), OSError(errno.ENOSPC, "full")]
+    )
+    def test_bar_is_closed_on_every_exit_path(self, failure: BaseException) -> None:
+        """A bar left open would keep its last redraw on the terminal."""
+        closed: list[bool] = []
+
+        class ClosingTqdm(_FakeTqdm):
+            def close(self) -> None:
+                closed.append(True)
+
+        def fake_pipeline(cfg: object, should_stop: object = None) -> "Generator[str, None, None]":
+            yield "aa"
+            raise failure
+
+        with mock.patch.dict(
+            sys.modules, {"tqdm": types.SimpleNamespace(tqdm=ClosingTqdm)}
+        ), mock.patch("bitbrew._build_pipeline", side_effect=fake_pipeline), \
+             mock.patch.object(sys, "stdout", _RecordingStdout(tty=False)), \
+             mock.patch("bitbrew._detach_stdout"):
+            main(["-p", "a*", "--charset", "xy"])
+
+        assert closed == [True]

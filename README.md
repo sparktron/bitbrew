@@ -329,13 +329,23 @@ Streaming to a **terminal** ignores the chunk size and writes one line at a time
 appears as it is generated rather than in bursts. Redirect or pipe the stream and the full
 chunk applies.
 
-**Optional progress bar** — install `tqdm` and bitbrew will display a live progress counter automatically when writing to a file:
+**Optional progress bar** — install `tqdm` and bitbrew will display a live progress
+counter on stderr, both when writing to a file and when the stdout stream is redirected
+or piped:
 
 ```bash
 pip install tqdm
 bitbrew -p "*****" --charset lower --force -o big.txt
 # Generating: 100%|████████████| 11.9M/11.9M [00:04<00:00, 2.54Mwords/s]
+
+bitbrew -p "*****" --charset lower --force > big.txt
+# Generating: 100%|████████████| 11.9M/11.9M [00:02<00:00, 6.31Mwords/s]
 ```
+
+The bar appears only where it helps. Streaming to a **terminal** shows none: the words
+are already scrolling past, and the redraws would fight them for the same lines. A
+**redirected stderr** shows none either, so a log file collects the summary rather than
+a few thousand carriage returns.
 
 When `--min-len`, `--max-len`, `--filter`, or deduplication are in play the final count
 is not knowable up front, so bitbrew shows a plain counter instead of a percentage bar

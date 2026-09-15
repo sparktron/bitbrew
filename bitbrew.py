@@ -1518,8 +1518,11 @@ def _make_progress(cfg: _RunConfig) -> _ProgressBar | None:
     except ImportError:
         return None
     # Without an exact count a bar could never reach 100%, so show a counter.
+    # disable=None is tqdm's own "only when my stream is a terminal" setting;
+    # it writes to stderr, so a redirected stderr collects redraw spam without
+    # it -- carriage returns and half-drawn bars in a log file.
     bar: _ProgressBar = tqdm_mod.tqdm(
-        total=cfg.exact_output_count, unit="words", desc="Generating"
+        total=cfg.exact_output_count, unit="words", desc="Generating", disable=None
     )
     return bar
 
@@ -1642,7 +1645,38 @@ def _stdout_is_terminal() -> bool:
 
 
 def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
-    """Stream words to stdout, gzipped when asked.
+    """Stream words to stdout, with a progress bar where one helps.
+
+    A bar only earns its place when the words are going somewhere other than
+    the screen. At a terminal they are already scrolling past, and tqdm's
+    redraws would fight them for the same lines, so the bar is left off
+    entirely; _make_progress then drops it again if stderr is not a terminal.
+    That leaves it exactly where it is useful: `bitbrew ... > big.txt` with the
+    terminal free to show how far along the run is.
+
+    Args:
+        words: The finished word stream.
+        cfg: Resolved run configuration.
+
+    Returns:
+        Process exit code.
+    """
+    at_terminal = _stdout_is_terminal()
+    progress = None if at_terminal else _make_progress(cfg)
+    try:
+        return _stream_to_stdout(words, cfg, at_terminal, progress)
+    finally:
+        if progress is not None:
+            progress.close()
+
+
+def _stream_to_stdout(
+    words: Iterable[str],
+    cfg: _RunConfig,
+    at_terminal: bool,
+    progress: _ProgressBar | None,
+) -> int:
+    """Write the stream to stdout, gzipped when asked.
 
     Exit codes match the -o path: 130 when interrupted, 1 when the write
     fails. A closed downstream pipe is the one success case -- `| head`
@@ -1657,6 +1691,8 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
     Args:
         words: The finished word stream.
         cfg: Resolved run configuration.
+        at_terminal: Whether stdout is a terminal, resolved once by the caller.
+        progress: Bar to advance, or None when one would not help.
 
     Returns:
         Process exit code.
@@ -1667,10 +1703,10 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
         # output while reaching only the -o and --compress paths. At a terminal
         # a person is reading along, so latency beats throughput and the chunk
         # drops to a single line; a redirect or a pipe gets the full chunk.
-        chunk_size = 1 if _stdout_is_terminal() else cfg.chunk_size
+        chunk_size = 1 if at_terminal else cfg.chunk_size
         # BrokenPipeError subclasses OSError, so it has to be caught first.
         try:
-            _chunked_write(words, sys.stdout, chunk_size)
+            _chunked_write(words, sys.stdout, chunk_size, progress)
             sys.stdout.flush()
         except BrokenPipeError:
             _detach_stdout()
@@ -1685,7 +1721,7 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
         return 0
 
     # Gzip to stdout, but never at a terminal -- binary down a TTY is noise.
-    if _stdout_is_terminal():
+    if at_terminal:
         print(
             "Error: refusing to write compressed output to a terminal. "
             "Redirect it, pipe it, or use -o.",
@@ -1701,7 +1737,7 @@ def _write_to_stdout(words: Iterable[str], cfg: _RunConfig) -> int:
         return 1
     try:
         with gzip.GzipFile(fileobj=raw, mode="wb") as binary:
-            _chunked_write(words, binary, cfg.chunk_size)
+            _chunked_write(words, binary, cfg.chunk_size, progress)
         raw.flush()
     except BrokenPipeError:
         _detach_stdout()
