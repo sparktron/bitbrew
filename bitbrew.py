@@ -1754,11 +1754,13 @@ def _dedup_stage(words: Iterator[str], cfg: _RunConfig) -> Iterator[str]:
                 cfg.dedup_capacity, cfg.dedup_error, _BLOOM_MAX_BYTES, plan=plan
             ),
         )
-    if cfg.total_estimate > _DEDUP_WARN_THRESHOLD:
+    # dedup_capacity, not the full estimate: --limit caps what the set can
+    # ever hold, exactly as it caps what the Bloom filter is sized for.
+    held = cfg.dedup_capacity
+    if held > _DEDUP_WARN_THRESHOLD:
         print(
-            f"Warning: deduplicating ~{_format_count(cfg.total_estimate)} words "
-            f"holds them all in "
-            f"memory (roughly {_human_bytes(cfg.total_estimate * _BYTES_PER_WORD)}). "
+            f"Warning: deduplicating ~{_format_count(held)} words holds them all in "
+            f"memory (roughly {_human_bytes(held * _BYTES_PER_WORD)}). "
             f"Use --dedup-approx for bounded memory, or --no-dedup to stream.",
             file=sys.stderr,
         )

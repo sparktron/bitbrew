@@ -3053,3 +3053,31 @@ class TestExactEstimates:
     )
     def test_format_count(self, count: int, shown: str) -> None:
         assert bitbrew._format_count(count) == shown
+
+
+class TestDedupWarningHonoursLimit:
+    """The exact-dedup memory warning must size what dedup will actually hold.
+
+    It quoted the full estimate, so a run limited to three words warned that
+    deduplication would hold 12 million of them in 1.1 GiB.
+    """
+
+    def test_limited_run_does_not_warn(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with mock.patch.object(sys, "stdout", _RecordingStdout(tty=False)):
+            ret = main(["-p", "*****", "-p", "a****", "--limit", "3", "--force"])
+        assert ret == 0
+        assert "holds them all in memory" not in capsys.readouterr().err
+
+    def test_warning_quotes_the_limited_size(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with mock.patch("bitbrew._chunked_write", return_value=0), \
+             mock.patch.object(sys, "stdout", _RecordingStdout(tty=False)):
+            ret = main(["-p", "*****", "-p", "a****", "--limit", "2000000", "--force"])
+        assert ret == 0
+        assert "deduplicating ~2,000,000 words" in capsys.readouterr().err
+
+    def test_unlimited_run_still_warns(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with mock.patch("bitbrew._chunked_write", return_value=0), \
+             mock.patch.object(sys, "stdout", _RecordingStdout(tty=False)):
+            ret = main(["-p", "*****", "-p", "a****", "--force"])
+        assert ret == 0
+        assert "deduplicating ~12,338,352 words" in capsys.readouterr().err
