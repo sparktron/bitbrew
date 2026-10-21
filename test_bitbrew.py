@@ -2958,3 +2958,22 @@ class TestProbePrefix:
         ret = main(["-p", "pass*", "--charset", "digits", "--filter", r"^pass(\d|\d)+$"])
         assert ret == 1
         assert "backtracking" in capsys.readouterr().err
+
+
+class TestInterruptDuringResolution:
+    """Ctrl-C before generation starts must exit like Ctrl-C during it.
+
+    Option resolution runs the ReDoS probe, which can take a noticeable moment,
+    before the interrupt guard is installed. An interrupt there escaped main()
+    as a traceback.
+    """
+
+    def test_interrupt_while_screening_exits_130(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with mock.patch("bitbrew._probe_regex_blowup", side_effect=KeyboardInterrupt):
+            ret = main(["-p", "a*", "--charset", "xy", "--filter", "^a"])
+        assert ret == 130
+        captured = capsys.readouterr()
+        assert "Interrupted" in captured.err
+        assert captured.out == ""

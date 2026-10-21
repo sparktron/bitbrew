@@ -2033,6 +2033,11 @@ def main(argv: list[str] | None = None) -> int:
     except _CliError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        # Resolution screens --filter, which can take a moment, and runs
+        # before the interrupt guard exists. Exit the way the guarded run does.
+        print("\nInterrupted.", file=sys.stderr)
+        return 130
 
     # Counting is free when nothing can drop a word, so answer before the
     # scale guard: previewing a huge pattern should not need --force.
