@@ -201,12 +201,15 @@ two ways before generating anything:
    consume.
 
 The probe costs well under a millisecond for a normal filter and stops after a match pushes
-its cumulative work over the time budget. The structural pass itself is linear, including
-for malformed patterns; syntax errors are then reported by Python's regex compiler.
+its cumulative work over the time budget. Its inputs start one character long and grow one
+character at a time, so no single match can overshoot that budget by more than one step of
+growth: even a 30-way alternation is rejected in about a second. The structural pass itself
+is linear, including for malformed patterns; syntax errors are then reported by Python's
+regex compiler.
 
 ```bash
 $ bitbrew -p "***" --filter "(a|a)+$"
-Error: unsafe regex '(a|a)+$': matching took 176 ms on a 20-character input, which
+Error: unsafe regex '(a|a)+$': matching took 81 ms on an 18-character input, which
 indicates catastrophic backtracking (ReDoS). Use --allow-unsafe-regex to run it anyway.
 ```
 

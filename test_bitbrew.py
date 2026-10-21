@@ -951,6 +951,18 @@ class TestRegexBlowupProbe:
         assert _probe_regex_blowup(re.compile(pattern), pattern) is not None
         assert time.perf_counter() - start < 2.0
 
+    @pytest.mark.parametrize("branches", [8, 14])
+    def test_high_fanout_alternation_cannot_stall_screening(self, branches: int) -> None:
+        """The budget is checked between searches, so no one search may be huge.
+
+        A ladder starting at length 8 made the first search alone cost about
+        branches**8 steps: 60 s for 14 branches before the budget was consulted.
+        """
+        pattern = "(" + "|".join(["a"] * branches) + ")+$"
+        start = time.perf_counter()
+        assert _probe_regex_blowup(re.compile(pattern), pattern) is not None
+        assert time.perf_counter() - start < 5.0
+
     def test_probe_overhead_on_safe_pattern_is_negligible(self) -> None:
         """The common case -- a safe filter -- must not cost real time."""
         start = time.perf_counter()

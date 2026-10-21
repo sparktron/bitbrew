@@ -306,7 +306,13 @@ def _expand_pattern(pattern: str, chars: str) -> Generator[str, None, None]:
 # inputs long before any single match becomes slow. Probing bails the moment
 # the cumulative budget is spent, which bounds the cost of screening a
 # genuinely pathological pattern.
-_PROBE_LENGTHS = tuple(range(8, 41, 2))
+#
+# The budget is only consulted between searches, so the ladder starts short and
+# climbs one character at a time: a single search can then overshoot it by at
+# most one step's growth factor. Starting at eight characters made the first
+# search alone cost branches**8 steps -- a minute for (a|a|...|a)+$ with
+# fourteen branches -- before the budget was ever checked.
+_PROBE_LENGTHS = tuple(range(1, 41))
 _PROBE_BUDGET = 0.05  # seconds of cumulative match time before we call it unsafe
 _PROBE_MAX_SEEDS = 4
 
