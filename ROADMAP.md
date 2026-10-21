@@ -25,19 +25,24 @@
   as literal characters.
 - Show the progress bar for redirected stdout runs, and keep it off a terminal and out of
   a redirected stderr.
+- Write character devices and FIFOs in place, follow symlinks to their target, keep an
+  overwritten file's permission bits, and refuse other file types, so `--overwrite` never
+  replaces the entry `-o` names (H1).
+- Refuse charset and pattern text that is not valid UTF-8, or that stdout's encoding cannot
+  represent, before writing, and remove the sidecar on any failure (M1).
+- Refuse line breaks in the charset and patterns, and read `--charset-file` untranslated and
+  without its byte order mark (M5).
+- Start the ReDoS probe ladder at one character so screening cannot stall on its first
+  search (M3).
+- Probe ReDoS candidates behind the literal prefix they require (M2).
+- Exit 130 instead of a traceback on Ctrl-C during option resolution (L4).
 
 ## Next
 
-Phase 3 review findings, detailed with repros and fixes in
+Phase 3 review findings still open, detailed with repros and fixes in
 [docs/REMEDIATION_REPORT.md](docs/REMEDIATION_REPORT.md):
 
-- H1: Stop `--overwrite` from replacing device nodes, FIFOs and symlinks, and keep an
-  overwritten file's mode.
-- M1: Reject non-UTF-8 input up front, and remove the sidecar on any failure.
-- M2: Probe ReDoS candidates behind the pattern's required literal prefix.
-- M3: Bound the timing probe's own cost by starting the ladder short.
 - M4: Drop the 10^15 estimate clamp so `--count` and `estimate_count()` stay exact.
-- M5: Reject newlines in the charset and patterns, and read `--charset-file` untranslated.
-- L1-L8: Correct the interrupted-gzip README claim, cap `--chunk-size`, size the dedup
-  warning from `--limit`, handle Ctrl-C during screening, tidy the `-o` edge cases, raise
-  the setuptools floor to 77, refresh the CI matrix and pins, and de-flake the timing checks.
+- L1-L3, L5-L8: Correct the interrupted-gzip README claim, cap `--chunk-size`, size the
+  dedup warning from `--limit`, tidy the `-o` edge cases, raise the setuptools floor to 77,
+  refresh the CI matrix and pins, and de-flake the timing checks.
