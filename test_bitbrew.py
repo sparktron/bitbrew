@@ -2695,3 +2695,77 @@ class TestStdoutProgressBar:
             main(["-p", "a*", "--charset", "xy"])
 
         assert closed == [True]
+
+
+class TestNonRegularOutput:
+    """--overwrite updates what -o names; it must not swap the entry for a file.
+
+    Placement renames a sidecar over the output path, which replaces the
+    directory entry whatever it is. For a regular file that is the point; for a
+    device, a FIFO or a symlink it destroys the thing the user pointed at.
+    """
+
+    def test_fifo_is_written_into_not_replaced(self, tmp_path: "os.PathLike[str]") -> None:
+        fifo = os.path.join(str(tmp_path), "pipe")
+        os.mkfifo(fifo)
+        # The reader has to be open before the writer, as with any FIFO.
+        reader = subprocess.Popen(["cat", fifo], stdout=subprocess.PIPE, text=True)
+        try:
+            ret = main(["-p", "a*", "--charset", "xy", "-o", fifo, "--overwrite"])
+            out, _ = reader.communicate(timeout=10)
+        finally:
+            reader.kill()
+        assert ret == 0
+        assert stat.S_ISFIFO(os.lstat(fifo).st_mode), "the FIFO was replaced"
+        assert out.split() == ["ax", "ay"]
+        assert not _sidecars(tmp_path)
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="mknod needs root")
+    def test_character_device_is_written_into_not_replaced(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """`-o /dev/null --overwrite` as root must not replace /dev/null."""
+        null = os.path.join(str(tmp_path), "null")
+        os.mknod(null, stat.S_IFCHR | 0o666, os.makedev(1, 3))
+        assert main(["-p", "a*", "--charset", "xy", "-o", null, "--overwrite"]) == 0
+        assert stat.S_ISCHR(os.lstat(null).st_mode), "the device node was replaced"
+        assert not _sidecars(tmp_path)
+
+    def test_symlink_is_kept_and_its_target_updated(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        target = os.path.join(str(tmp_path), "target.txt")
+        link = os.path.join(str(tmp_path), "link.txt")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("stale\n")
+        os.symlink(target, link)
+
+        assert main(["-p", "a*", "--charset", "xy", "-o", link, "--overwrite"]) == 0
+
+        assert os.path.islink(link), "the symlink was replaced"
+        with open(target, encoding="utf-8") as handle:
+            assert handle.read().split() == ["ax", "ay"]
+        assert not _sidecars(tmp_path)
+
+    def test_overwritten_file_keeps_its_mode(self, tmp_path: "os.PathLike[str]") -> None:
+        """A 0600 wordlist must not come back readable by everyone."""
+        outfile = os.path.join(str(tmp_path), "private.txt")
+        with open(outfile, "w", encoding="utf-8") as handle:
+            handle.write("secret\n")
+        os.chmod(outfile, 0o600)
+
+        assert main(["-p", "a*", "--charset", "xy", "-o", outfile, "--overwrite"]) == 0
+
+        assert stat.S_IMODE(os.stat(outfile).st_mode) == 0o600
+
+    def test_other_file_types_are_refused(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """A directory cannot hold a wordlist; say so instead of a rename error."""
+        directory = os.path.join(str(tmp_path), "sub")
+        os.mkdir(directory)
+        ret = main(["-p", "a*", "--charset", "xy", "-o", directory, "--overwrite"])
+        assert ret == 1
+        assert "is not a regular file" in capsys.readouterr().err
+        assert os.path.isdir(directory)
+        assert not _sidecars(tmp_path)

@@ -28,6 +28,7 @@ import os
 import re
 import secrets
 import signal
+import stat
 import sys
 import time
 from collections.abc import Callable, Generator, Iterable, Iterator
@@ -890,6 +891,57 @@ def _place_output(temp_path: str, output_path: str, overwrite: bool) -> None:
     _remove_if_exists(temp_path)
 
 
+def _open_output(output_path: str) -> tuple[int, str | None, str]:
+    """Open the destination the way its file type calls for.
+
+    Placement renames a sidecar over the target, which replaces the directory
+    entry whatever it was. That is the point for a regular file and wrong for
+    everything else: as root, `-o /dev/null --overwrite` would swap the system
+    /dev/null for a regular file, and a FIFO's reader would never see a word.
+    A character device or a FIFO is therefore written directly, the way a
+    shell redirect would. A symlink is resolved once, here, so the link
+    survives and its target is what gets replaced; resolving it again at
+    placement would let a link planted mid-run redirect the write.
+
+    An existing file's permission bits are copied onto the sidecar before any
+    word is written, so a wordlist kept at 0600 neither comes back at the
+    umask default nor sits wider than that while the run is in progress.
+    Ownership cannot be carried over without privilege and is not attempted.
+
+    Args:
+        output_path: The -o value.
+
+    Returns:
+        (handle, temp_path, target). temp_path is the sidecar to place onto
+        target once the run completes, or None when handle writes to the
+        target directly.
+
+    Raises:
+        OSError: If the target cannot be opened, or is a file type that cannot
+            hold a wordlist, such as a directory or a block device.
+    """
+    target = os.path.realpath(output_path)
+    try:
+        existing: os.stat_result | None = os.stat(target)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        if stat.S_ISCHR(existing.st_mode) or stat.S_ISFIFO(existing.st_mode):
+            return os.open(target, os.O_WRONLY), None, target
+        raise OSError(
+            f"'{output_path}' is not a regular file, character device or FIFO"
+        )
+    handle, temp_path = _create_sidecar(target)
+    if existing is not None:
+        try:
+            os.chmod(temp_path, stat.S_IMODE(existing.st_mode))
+        except OSError:
+            os.close(handle)
+            _remove_if_exists(temp_path)
+            raise
+    return handle, temp_path, target
+
+
 _FORCE_THRESHOLD = 10_000_000  # combinations above which --force is required
 _BLOOM_MAX_BYTES = 1 << 31  # 2 GiB ceiling on the approximate-dedup filter
 
@@ -1579,9 +1631,11 @@ def _write_to_file(
     # unrelated leftover file, and two concurrent runs would corrupt each other.
     temp_path: str | None = None
     progress: _ProgressBar | None = None
+    in_place = False
     try:
         progress = _make_progress(cfg)
-        handle, temp_path = _create_sidecar(output_path)
+        handle, temp_path, target = _open_output(output_path)
+        in_place = temp_path is None
         if cfg.use_compress:
             with (
                 os.fdopen(handle, "wb") as raw,
@@ -1603,12 +1657,16 @@ def _write_to_file(
         if should_stop():
             raise KeyboardInterrupt
 
-        _place_output(temp_path, output_path, cfg.overwrite)
+        if temp_path is not None:
+            _place_output(temp_path, target, cfg.overwrite)
         print(f"Wrote {written:,} words to {output_path}", file=sys.stderr)
     except KeyboardInterrupt:
         if temp_path is not None:
             _remove_if_exists(temp_path)
-        print("\nInterrupted. Partial output file removed.", file=sys.stderr)
+        if in_place:
+            print("\nInterrupted.", file=sys.stderr)
+        else:
+            print("\nInterrupted. Partial output file removed.", file=sys.stderr)
         return 130
     except FileExistsError:
         # The output appeared after the resolve-time guard: a concurrent run,

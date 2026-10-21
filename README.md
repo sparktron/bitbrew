@@ -369,6 +369,12 @@ primitive, so the check is instead made immediately before the rename. The refus
 there rather than atomic — but the output path is still never created until the finished wordlist
 is what lands on it.
 
+Atomic placement applies to regular files only. A character device or FIFO named by `-o` is
+written into directly, the way a shell redirect would, so `-o /dev/null --overwrite` never
+replaces the device node. A symlink is followed: the link stays, and its target is what gets
+replaced. Overwriting an existing file keeps its permission bits (a `0600` wordlist stays
+`0600`), but not its owner. A directory or any other file type is refused.
+
 ---
 
 ### Safety flags
