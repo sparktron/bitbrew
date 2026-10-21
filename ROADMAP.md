@@ -36,13 +36,24 @@
   search (M3).
 - Probe ReDoS candidates behind the literal prefix they require (M2).
 - Exit 130 instead of a traceback on Ctrl-C during option resolution (L4).
+- Keep word-count estimates exact past 10**15, so `--count` and `estimate_count()` answer
+  any pattern size (M4).
+- Correct the README: an interrupted `--compress` stream is not a valid archive (L1).
+- Cap `--chunk-size` at 100,000 words on every output path (L2).
+- Size the exact-dedup memory warning from `--limit` (L3).
+- Require setuptools 77, the first to accept the SPDX license string (L6).
+- Test Python 3.11-3.14 and drop 3.10, which reaches end of life in October 2026 (L7).
 
 ## Next
 
 Phase 3 review findings still open, detailed with repros and fixes in
 [docs/REMEDIATION_REPORT.md](docs/REMEDIATION_REPORT.md):
 
-- M4: Drop the 10^15 estimate clamp so `--count` and `estimate_count()` stay exact.
-- L1-L3, L5-L8: Correct the interrupted-gzip README claim, cap `--chunk-size`, size the
-  dedup warning from `--limit`, tidy the `-o` edge cases, raise the setuptools floor to 77,
-  refresh the CI matrix and pins, and de-flake the timing checks.
+- L5: Say when `-o` names a directory instead of suggesting `--overwrite`, and decide
+  whether `-o -` means stdout.
+- L7: Pin GitHub Actions to commit SHAs and the lint tools to versions, and type-check the
+  tests.
+- L8: Replace wall-clock assertions in tests with work counts, and make the timing probe
+  measure growth rather than an absolute budget.
+- I1-I4: Reproducible gzip headers, narrower dedup for `?`, test classes grouped by
+  behaviour, and complete library docstrings.
