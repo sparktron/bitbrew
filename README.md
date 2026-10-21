@@ -364,8 +364,10 @@ that could never reach 100%.
 
 **Interrupted?** Pressing `Ctrl+C` stops generation promptly and exits with code `130`,
 whether the run is writing to a file, streaming to stdout, or counting. File output removes
-its partial file first. A run interrupted mid-`--compress` leaves a valid archive of however
-much it had finished, and the non-zero exit code tells you it is a prefix, not the whole list.
+its partial file first. A compressed stream to stdout cannot be taken back, and one
+interrupted mid-`--compress` is cut off inside the archive, so it will not decompress: bitbrew
+says so ("Compressed output is incomplete"), and the non-zero exit code is there so a script
+discards it rather than using it.
 
 **Atomic output:** bitbrew builds into a `<output>.<random>.part` sidecar and renames it into place
 only once the run completes. An interrupted or failed run — a full disk, a permissions
