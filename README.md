@@ -134,12 +134,17 @@ It is a warning, not a rejection — a raw charset is allowed to look like anyth
 
 **Commas and spaces** cannot be expressed through `--charset`, since it splits on commas
 and trims whitespace. Use `--charset-file` to supply a charset verbatim — every character
-in the file is used as-is, apart from a single trailing newline:
+in the file is used as-is, apart from a single trailing newline (`\n` or `\r\n`) and a UTF-8
+byte order mark:
 
 ```bash
 printf 'abc, ' > charset.txt
 bitbrew -p "**" --charset-file charset.txt
 ```
+
+The one thing a charset or pattern cannot hold is a line break. Output is one word per line,
+so a `\n` or `\r` inside a word would split it across two lines. bitbrew refuses it instead,
+which most often catches a blank line left at the end of a charset file.
 
 ---
 

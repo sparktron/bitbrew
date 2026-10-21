@@ -2840,3 +2840,61 @@ class TestUnencodableInput:
         ret = main(["-p", "*", "--charset-file", path])
         assert ret == 1
         assert "could not read --charset-file" in capsys.readouterr().err
+
+
+class TestLineBreaksInInput:
+    """The output is one word per line, so a word must never hold a line break.
+
+    A newline in the charset or a pattern split such words across lines and
+    corrupted the wordlist silently -- most often from an editor leaving a
+    blank line at the end of a --charset-file.
+    """
+
+    @staticmethod
+    def _write_bytes(tmp_path: "os.PathLike[str]", data: bytes) -> str:
+        path = os.path.join(str(tmp_path), "cs.txt")
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def test_crlf_terminator_is_stripped(self, tmp_path: "os.PathLike[str]") -> None:
+        """Text-mode reading used to translate it first, leaving a dead branch."""
+        assert load_charset_file(self._write_bytes(tmp_path, b"ab\r\n")) == "ab"
+
+    def test_lone_carriage_return_is_not_translated(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """Verbatim means verbatim: '\\r' must not come back as '\\n'."""
+        assert load_charset_file(self._write_bytes(tmp_path, b"a\rb")) == "a\rb"
+
+    def test_byte_order_mark_is_not_a_charset_character(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        path = self._write_bytes(tmp_path, b"\xef\xbb\xbfab")
+        assert load_charset_file(path) == "ab"
+
+    def test_trailing_blank_line_in_charset_file_is_refused(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        path = self._write_bytes(tmp_path, b"ab\n\n")
+        ret = main(["-p", "x*", "--charset-file", path])
+        assert ret == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "line break" in captured.err
+
+    @pytest.mark.parametrize("charset", ["a\nb", "a\rb"])
+    def test_line_break_in_charset_is_refused(
+        self, charset: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(["-p", "*", "--charset", charset])
+        assert ret == 1
+        assert "line break" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("pattern", ["a\nb*", "a\\\nb*", "a\r*"])
+    def test_line_break_in_pattern_is_refused(
+        self, pattern: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(["-p", pattern, "--charset", "xy"])
+        assert ret == 1
+        assert "line break" in capsys.readouterr().err

@@ -136,7 +136,9 @@ def load_charset_file(path: str) -> str:
 
     Unlike --charset, nothing is split or stripped, so commas and spaces can be
     part of the charset. A single trailing newline is ignored, since almost
-    every editor adds one.
+    every editor adds one, and so is a UTF-8 byte order mark. Newlines are
+    read untranslated: universal-newline mode would turn a lone "\\r" into
+    "\\n" before the caller could see it.
 
     Args:
         path: File to read.
@@ -147,7 +149,7 @@ def load_charset_file(path: str) -> str:
     Raises:
         OSError: If the file cannot be read.
     """
-    with open(path, encoding="utf-8") as handle:
+    with open(path, encoding="utf-8-sig", newline="") as handle:
         data = handle.read()
     if data.endswith("\r\n"):
         data = data[:-2]
@@ -1419,6 +1421,35 @@ def _unencodable(text: str, encoding: str) -> str | None:
     return None
 
 
+def _check_line_breaks(charset: str, patterns: list[str], from_file: bool) -> None:
+    """Refuse input that would put a line break inside a word.
+
+    The output is one word per line. A newline in the charset or a pattern
+    splits every word holding it across two lines, which corrupts the wordlist
+    without any error -- most often from an editor leaving a blank line at the
+    end of a --charset-file. A carriage return is refused too: line-oriented
+    readers commonly treat it as a terminator.
+
+    Args:
+        charset: The resolved charset.
+        patterns: The patterns as given.
+        from_file: Whether the charset came from --charset-file.
+
+    Raises:
+        _CliError: If any of them holds "\\n" or "\\r".
+    """
+    hint = " Is there a blank line at the end of the file?" if from_file else ""
+    sources = [("the charset", charset, hint)]
+    sources += [(f"pattern {pattern!r}", pattern, "") for pattern in patterns]
+    for name, text, extra in sources:
+        for char in "\n\r":
+            if char in text:
+                raise _CliError(
+                    f"{name} contains a line break ({char!r}), which would split "
+                    f"every word holding it across two lines of output.{extra}"
+                )
+
+
 def _check_encodable(charset: str, patterns: list[str], text_stdout: bool) -> None:
     """Refuse input the destination cannot encode, before anything is written.
 
@@ -1504,6 +1535,8 @@ def _resolve_options(args: argparse.Namespace) -> _RunConfig:
                 file=sys.stderr,
             )
         total_estimate += _count_from_kinds(kinds, len(charset))
+
+    _check_line_breaks(charset, args.pattern, from_file=args.charset_file is not None)
 
     output_path = args.output
     use_compress = args.compress or bool(output_path and output_path.endswith(".gz"))
