@@ -28,4 +28,16 @@
 
 ## Next
 
-Nothing outstanding from the audit. New items land here as they are found.
+Phase 3 review findings, detailed with repros and fixes in
+[docs/REMEDIATION_REPORT.md](docs/REMEDIATION_REPORT.md):
+
+- H1: Stop `--overwrite` from replacing device nodes, FIFOs and symlinks, and keep an
+  overwritten file's mode.
+- M1: Reject non-UTF-8 input up front, and remove the sidecar on any failure.
+- M2: Probe ReDoS candidates behind the pattern's required literal prefix.
+- M3: Bound the timing probe's own cost by starting the ladder short.
+- M4: Drop the 10^15 estimate clamp so `--count` and `estimate_count()` stay exact.
+- M5: Reject newlines in the charset and patterns, and read `--charset-file` untranslated.
+- L1-L8: Correct the interrupted-gzip README claim, cap `--chunk-size`, size the dedup
+  warning from `--limit`, handle Ctrl-C during screening, tidy the `-o` edge cases, raise
+  the setuptools floor to 77, refresh the CI matrix and pins, and de-flake the timing checks.
