@@ -2769,3 +2769,74 @@ class TestNonRegularOutput:
         assert "is not a regular file" in capsys.readouterr().err
         assert os.path.isdir(directory)
         assert not _sidecars(tmp_path)
+
+
+class TestUnencodableInput:
+    """Text the destination cannot encode must fail cleanly, before any write.
+
+    Undecodable argv bytes reach Python as lone surrogates, which strict UTF-8
+    refuses; a stdout in a narrow encoding refuses anything outside it. Either
+    used to escape as a UnicodeEncodeError traceback mid-write.
+    """
+
+    def test_surrogate_in_charset_is_refused_before_writing(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        outfile = os.path.join(str(tmp_path), "words.txt")
+        ret = main(["-p", "*", "--charset", "a\udcff", "-o", outfile])
+        assert ret == 1
+        assert "not valid UTF-8" in capsys.readouterr().err
+        assert os.listdir(str(tmp_path)) == []
+
+    def test_surrogate_in_pattern_is_refused(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(["-p", "x\udcff*", "--charset", "ab"])
+        assert ret == 1
+        assert "not valid UTF-8" in capsys.readouterr().err
+
+    def test_stdout_that_cannot_encode_the_words_is_refused(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        narrow = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
+        with mock.patch.object(sys, "stdout", narrow):
+            ret = main(["-p", "*", "--charset", "aé"])
+        assert ret == 1
+        err = capsys.readouterr().err
+        assert "stdout encoding 'ascii'" in err
+        assert "-o" in err
+
+    def test_compressed_stdout_ignores_the_text_encoding(self) -> None:
+        """--compress writes UTF-8 bytes, so the text layer's codec is moot."""
+        raw = io.BytesIO()
+        narrow = io.TextIOWrapper(raw, encoding="ascii")
+        with mock.patch.object(sys, "stdout", narrow):
+            assert main(["-p", "*", "--charset", "é", "--compress"]) == 0
+        assert gzip.decompress(raw.getvalue()).decode() == "é\n"
+
+    def test_unexpected_error_still_removes_the_sidecar(
+        self, tmp_path: "os.PathLike[str]"
+    ) -> None:
+        """Cleanup must not depend on the failure being one the handler names."""
+        outfile = os.path.join(str(tmp_path), "words.txt")
+
+        def failing_pipeline(
+            cfg: object, should_stop: object = None
+        ) -> "Generator[str, None, None]":
+            yield "aa"
+            raise RuntimeError("unexpected")
+
+        with mock.patch("bitbrew._build_pipeline", side_effect=failing_pipeline), \
+             pytest.raises(RuntimeError):
+            main(["-p", "a*", "--charset", "xy", "-o", outfile])
+        assert os.listdir(str(tmp_path)) == []
+
+    def test_charset_file_that_is_not_utf8_is_reported(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: "os.PathLike[str]"
+    ) -> None:
+        path = os.path.join(str(tmp_path), "charset.bin")
+        with open(path, "wb") as handle:
+            handle.write(b"ab\xff")
+        ret = main(["-p", "*", "--charset-file", path])
+        assert ret == 1
+        assert "could not read --charset-file" in capsys.readouterr().err

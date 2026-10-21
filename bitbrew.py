@@ -1328,7 +1328,9 @@ def _resolve_charset_option(args: argparse.Namespace) -> str:
             raise _CliError("--charset and --charset-file are mutually exclusive.")
         try:
             return load_charset_file(args.charset_file)
-        except OSError as exc:
+        # A file that is not UTF-8 fails in the codec, not the OS, and
+        # UnicodeDecodeError is a ValueError.
+        except (OSError, UnicodeDecodeError) as exc:
             raise _CliError(
                 f"could not read --charset-file '{args.charset_file}': {exc}"
             ) from exc
@@ -1400,6 +1402,62 @@ def _resolve_dedup_option(args: argparse.Namespace) -> str:
     return "approx" if args.dedup_approx else "exact"
 
 
+def _unencodable(text: str, encoding: str) -> str | None:
+    """Find the first character an encoding cannot represent.
+
+    Args:
+        text: The text that will be written.
+        encoding: The destination's codec.
+
+    Returns:
+        The offending character, or None when all of text encodes.
+    """
+    try:
+        text.encode(encoding)
+    except UnicodeEncodeError as exc:
+        return text[exc.start]
+    return None
+
+
+def _check_encodable(charset: str, patterns: list[str], text_stdout: bool) -> None:
+    """Refuse input the destination cannot encode, before anything is written.
+
+    Bytes on the command line that are not valid UTF-8 reach Python as lone
+    surrogates, which no strict codec accepts, and a stdout in a narrow
+    encoding rejects whatever falls outside it. Found mid-write, either one
+    escaped as a UnicodeEncodeError traceback -- a ValueError, which none of
+    the write paths' OSError handlers catch -- and left the -o sidecar behind.
+
+    Args:
+        charset: The resolved charset.
+        patterns: The patterns as given.
+        text_stdout: Whether words go to stdout as text, through its codec.
+            Files and --compress output are always UTF-8.
+
+    Raises:
+        _CliError: If some character cannot be written.
+    """
+    sources = [("the charset", charset)]
+    sources += [(f"pattern {pattern!r}", pattern) for pattern in patterns]
+    for name, text in sources:
+        char = _unencodable(text, "utf-8")
+        if char is not None:
+            raise _CliError(
+                f"{name} contains {char!r}, which is not valid UTF-8. Bytes on the "
+                f"command line that do not decode as UTF-8 arrive this way."
+            )
+    encoding = getattr(sys.stdout, "encoding", None) if text_stdout else None
+    if not encoding:
+        return
+    for _, text in sources:
+        char = _unencodable(text, encoding)
+        if char is not None:
+            raise _CliError(
+                f"stdout encoding '{encoding}' cannot represent {char!r}. Write "
+                f"with -o, which is always UTF-8, or set PYTHONIOENCODING=utf-8."
+            )
+
+
 def _resolve_options(args: argparse.Namespace) -> _RunConfig:
     """Validate arguments and resolve them into a run configuration.
 
@@ -1448,6 +1506,13 @@ def _resolve_options(args: argparse.Namespace) -> _RunConfig:
         total_estimate += _count_from_kinds(kinds, len(charset))
 
     output_path = args.output
+    use_compress = args.compress or bool(output_path and output_path.endswith(".gz"))
+    _check_encodable(
+        charset,
+        args.pattern,
+        text_stdout=not output_path and not use_compress and not args.count,
+    )
+
     # --count prints to stdout and never opens the output path, so validating
     # it would refuse runs that cannot touch a file: `--count -o existing.txt`
     # asked about a write that is not going to happen.
@@ -1478,7 +1543,7 @@ def _resolve_options(args: argparse.Namespace) -> _RunConfig:
         limit=args.limit,
         chunk_size=args.chunk_size,
         output_path=output_path,
-        use_compress=args.compress or bool(output_path and output_path.endswith(".gz")),
+        use_compress=use_compress,
         overwrite=args.overwrite,
         dedup=_resolve_dedup_option(args),
         dedup_error=args.dedup_error,
@@ -1659,10 +1724,10 @@ def _write_to_file(
 
         if temp_path is not None:
             _place_output(temp_path, target, cfg.overwrite)
+            # Placed: the sidecar is gone or is now the output itself.
+            temp_path = None
         print(f"Wrote {written:,} words to {output_path}", file=sys.stderr)
     except KeyboardInterrupt:
-        if temp_path is not None:
-            _remove_if_exists(temp_path)
         if in_place:
             print("\nInterrupted.", file=sys.stderr)
         else:
@@ -1671,8 +1736,6 @@ def _write_to_file(
     except FileExistsError:
         # The output appeared after the resolve-time guard: a concurrent run,
         # or a file dropped in between. Refuse it the way the guard would have.
-        if temp_path is not None:
-            _remove_if_exists(temp_path)
         print(
             f"Error: output file '{output_path}' already exists. "
             f"Use --overwrite to replace.",
@@ -1680,11 +1743,13 @@ def _write_to_file(
         )
         return 1
     except OSError as exc:
-        if temp_path is not None:
-            _remove_if_exists(temp_path)
         print(f"Error: could not write to '{output_path}': {exc}", file=sys.stderr)
         return 1
     finally:
+        # Here rather than in each handler, so a failure none of them names --
+        # or an interrupt landing inside one -- still removes the sidecar.
+        if temp_path is not None:
+            _remove_if_exists(temp_path)
         if progress is not None:
             progress.close()
     return 0
