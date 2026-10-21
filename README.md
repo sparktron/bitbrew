@@ -198,7 +198,9 @@ two ways before generating anything:
    structural check sees. The alphabet is what the pattern *matches*, not the characters
    of its source: `\s` contributes a space, `\d` a digit, and literal punctuation counts,
    so `(\s|\s)+$` is probed with whitespace rather than with the letter `s` it can never
-   consume.
+   consume. Literal text the pattern requires up front is spelled out ahead of each probe,
+   so an anchored filter such as `^pass(\d|\d)+$` is exercised past its `pass` rather than
+   failing on the first character.
 
 The probe costs well under a millisecond for a normal filter and stops after a match pushes
 its cumulative work over the time budget. Its inputs start one character long and grow one

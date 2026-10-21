@@ -2910,3 +2910,51 @@ class TestLineBreaksInInput:
         ret = main(["-p", pattern, "--charset", "xy"])
         assert ret == 1
         assert "line break" in capsys.readouterr().err
+
+
+class TestProbePrefix:
+    """Probes must get past the literal text a pattern requires up front.
+
+    Every probe used to be one repeated seed, so a pattern demanding a literal
+    before its vulnerable group failed on the first character of each probe
+    and passed as safe. An anchored literal prefix is the most common shape a
+    real --filter takes.
+    """
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [r"^x(a|a)+$", r"^pass(\d|\d)+$", r"^-(a|a)+$", r"^[Pp]ass(\d|\d)+$",
+         r"\Aadmin(a|aa)+\Z", r"^a\.b(c|c)+$"],
+    )
+    def test_prefixed_catastrophic_patterns_are_probed_out(self, pattern: str) -> None:
+        assert _check_regex_safety(pattern) is None, "structural check is not the point"
+        assert _probe_regex_blowup(re.compile(pattern), pattern) is not None
+
+    @pytest.mark.parametrize(
+        "pattern", [r"^pass\d+$", r"^admin(foo|bar)$", r"^x[a-z]*$", r"^p(ab|cd)+$"]
+    )
+    def test_prefixed_safe_patterns_still_pass(self, pattern: str) -> None:
+        assert _probe_regex_blowup(re.compile(pattern), pattern) is None
+
+    @pytest.mark.parametrize(
+        ("pattern", "prefix"),
+        [
+            (r"^pass(\d|\d)+$", "pass"),
+            (r"^[Pp]ass(\d)+", "Pass"),
+            (r"\Aab\.c(x|x)+", "ab.c"),
+            (r"^\d\d-(a|a)+", "00-"),
+            (r"^ab+(c|c)+", "ab"),  # a repeated element is included once, then stops
+            (r"^ab?(c|c)+", "a"),  # an optional one is not required, so it stops
+            (r"(a|a)+$", ""),
+            (r"^.x(a|a)+$", ""),  # "." has no single member worth guessing
+        ],
+    )
+    def test_prefix_is_the_required_leading_literal(self, pattern: str, prefix: str) -> None:
+        assert bitbrew._probe_prefix(pattern) == prefix
+
+    def test_cli_rejects_a_prefixed_alternation(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(["-p", "pass*", "--charset", "digits", "--filter", r"^pass(\d|\d)+$"])
+        assert ret == 1
+        assert "backtracking" in capsys.readouterr().err

@@ -541,8 +541,74 @@ def _probe_seeds(pattern: str) -> list[str]:
     return seeds
 
 
+# Zero-width escapes: they constrain where a match sits but consume nothing,
+# so a prefix scan steps over them.
+_ZERO_WIDTH_ESCAPES = frozenset("AbBZ")
+
+
+def _probe_prefix(pattern: str) -> str:
+    """Spell out the literal text a pattern requires before anything repeats.
+
+    Probes built from a repeated seed alone fail on their first character
+    against a pattern such as "^pass(\\d|\\d)+$", which never reaches its
+    vulnerable group and so screens as safe. Prefixing the probes with text
+    the pattern demands up front gets them there.
+
+    The scan stops at the first construct it cannot turn into one definite
+    character: a group, a negated class, ".", an alternation, a backreference.
+    An element marked "*" or "?" is optional, so the scan stops before it; one
+    marked "+" or with a brace count is required, so it is spelled once and
+    the scan stops after it.
+
+    Args:
+        pattern: The raw regex source.
+
+    Returns:
+        The required leading text, or "" when there is none to find.
+    """
+    prefix: list[str] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "^":
+            index += 1
+            continue
+        if char == "\\":
+            following = pattern[index + 1] if index + 1 < len(pattern) else ""
+            index += 2
+            if following in _ZERO_WIDTH_ESCAPES:
+                continue
+            if following in _CLASS_MEMBERS:
+                unit = _CLASS_MEMBERS[following]
+            elif following and not following.isalnum():
+                unit = following
+            else:
+                break
+        elif char == "[":
+            members, index = _class_members(pattern, index)
+            if not members:
+                break
+            unit = members[0]
+        elif char in _METACHARACTERS:
+            break
+        else:
+            unit = char
+            index += 1
+        quantifier = pattern[index] if index < len(pattern) else ""
+        if quantifier in ("*", "?"):
+            break
+        prefix.append(unit)
+        if quantifier in ("+", "{"):
+            break
+    return "".join(prefix)
+
+
 def _probe_regex_blowup(regex: "re.Pattern[str]", pattern: str) -> str | None:
     """Time a compiled regex against growing adversarial inputs.
+
+    Each rung is tried bare and, when the pattern demands leading text, behind
+    that text as well. The bare form still matters: a top-level alternation
+    can make the "required" prefix belong to only one of its branches.
 
     Args:
         regex: The compiled pattern.
@@ -552,18 +618,21 @@ def _probe_regex_blowup(regex: "re.Pattern[str]", pattern: str) -> str | None:
         An error message if matching blows up, or None if it stays fast.
     """
     seeds = _probe_seeds(pattern)
+    prefix = _probe_prefix(pattern)
+    heads = ("", prefix) if prefix else ("",)
     spent = 0.0
     for length in _PROBE_LENGTHS:
-        for seed in seeds:
-            probe = (seed * (length // len(seed) + 1))[:length] + "\x00"
-            start = time.perf_counter()
-            regex.search(probe)
-            spent += time.perf_counter() - start
-            if spent > _PROBE_BUDGET:
-                return (
-                    f"matching took {spent * 1000:.0f} ms on a {length}-character "
-                    f"input, which indicates catastrophic backtracking (ReDoS)"
-                )
+        for head in heads:
+            for seed in seeds:
+                probe = head + (seed * (length // len(seed) + 1))[:length]
+                start = time.perf_counter()
+                regex.search(probe + "\x00")
+                spent += time.perf_counter() - start
+                if spent > _PROBE_BUDGET:
+                    return (
+                        f"matching took {spent * 1000:.0f} ms on a {len(probe)}-character "
+                        f"input, which indicates catastrophic backtracking (ReDoS)"
+                    )
     return None
 
 
