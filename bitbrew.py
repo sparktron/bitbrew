@@ -158,7 +158,6 @@ def load_charset_file(path: str) -> str:
     return _dedupe_chars(data)
 
 
-_MAX_ESTIMATE = 10**15  # cap to prevent unbounded memory/time
 _DEDUP_WARN_THRESHOLD = 1_000_000  # warn above this when dedup is in play
 _BYTES_PER_WORD = 100  # measured cost of holding one short word in a set
 
@@ -175,14 +174,14 @@ def _count_from_kinds(kinds: Iterable[str], charset_len: int) -> int:
         charset_len: Number of characters in the active charset.
 
     Returns:
-        Word count (capped at _MAX_ESTIMATE).
+        The exact word count. Python integers are unbounded and this is one
+        multiply per wildcard, so there is nothing to gain from a cap -- the
+        one this used to apply made counts past 10**15 silently wrong.
     """
     count = 1
     for kind in kinds:
         # "?" has one extra option: matching nothing at all.
         count *= charset_len if kind == "*" else charset_len + 1
-        if count > _MAX_ESTIMATE:
-            return _MAX_ESTIMATE
     return count
 
 
@@ -194,7 +193,7 @@ def estimate_count(pattern: str, charset_len: int) -> int:
         charset_len: Number of characters in the active charset.
 
     Returns:
-        Estimated word count (capped at _MAX_ESTIMATE).
+        The number of candidates the pattern expands to, exactly.
 
     Raises:
         ValueError: If the pattern ends with a dangling backslash.
@@ -844,6 +843,37 @@ def _needs_dedup(patterns: list[str]) -> bool:
     return "?" in _parse_pattern(patterns[0])[1]
 
 
+# Counts from here up are shown in scientific notation: a 22-digit figure
+# with separators is no easier to read than its order of magnitude.
+_PLAIN_COUNT_LIMIT = 10**21
+
+
+def _format_count(count: int) -> str:
+    """Format a word count for a message, however large it is.
+
+    Estimates are exact integers and can run to hundreds of digits. Converting
+    one to a float for "{:.2e}" overflows past 1e308, so the scientific form
+    is built with integer arithmetic instead.
+
+    Args:
+        count: A non-negative count.
+
+    Returns:
+        "3,670,344,486,987,776" below _PLAIN_COUNT_LIMIT, else a truncated
+        three-significant-figure form such as "1.79e+92".
+    """
+    if count < _PLAIN_COUNT_LIMIT:
+        return f"{count:,}"
+    exponent = int(math.log10(count))
+    # log10 returns a float, which can land one off right at a power of ten.
+    if 10**exponent > count:
+        exponent -= 1
+    elif 10 ** (exponent + 1) <= count:
+        exponent += 1
+    leading = count // 10 ** (exponent - 2)
+    return f"{leading // 100}.{leading % 100:02d}e+{exponent}"
+
+
 def _human_bytes(size: float) -> str:
     """Format a byte count using the largest unit that keeps it readable.
 
@@ -851,8 +881,12 @@ def _human_bytes(size: float) -> str:
         size: Number of bytes.
 
     Returns:
-        A string such as "95.4 MiB".
+        A string such as "95.4 MiB", or "over 1 PiB" past that. Exact
+        estimates make the sizes being formatted unbounded, and dividing an
+        integer past float range raises rather than rounding.
     """
+    if size >= 1024**5:
+        return "over 1 PiB"
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
         if size < 1024 or unit == "TiB":
             return f"{size:.1f} {unit}"
@@ -1023,6 +1057,10 @@ _FORCE_THRESHOLD = 10_000_000  # combinations above which --force is required
 _BLOOM_MAX_BYTES = 1 << 31  # 2 GiB ceiling on the approximate-dedup filter
 
 
+# Past this many items no filter of any feasible size has a useful error rate.
+_PLAN_CAPACITY_LIMIT = 10**18
+
+
 class _BloomSizing(NamedTuple):
     """The filter a memory budget can actually provide."""
 
@@ -1052,7 +1090,10 @@ def _plan_bloom(capacity: int, error_rate: float, max_bytes: int) -> _BloomSizin
         The bit count, probe count, and the rate actually achieved -- which is
         worse than requested whenever the ceiling binds.
     """
-    capacity = max(1, capacity)
+    # Clamped for the float arithmetic below, which overflows past 1e308. Any
+    # budget a machine could hold is long saturated by this point, so the plan
+    # -- error rate pinned at 1, and the run refused -- comes out the same.
+    capacity = max(1, min(capacity, _PLAN_CAPACITY_LIMIT))
     # The familiar continuous Bloom formula can undersize by a small amount
     # once the number of probes is rounded to an integer. Solve the formula for
     # the two neighbouring integer probe counts so an uncapped plan actually
@@ -1300,14 +1341,14 @@ class _RunConfig:
         """The output size, when it is knowable without generating anything.
 
         Returns:
-            The exact number of words the run will emit, or None when filters,
-            deduplication, or a saturated estimate make it unknowable.
+            The exact number of words the run will emit, or None when filters
+            or deduplication make it unknowable.
         """
         if self.dedup != "none":
             return None
         if self.min_len is not None or self.max_len is not None:
             return None
-        if self.regex is not None or self.total_estimate >= _MAX_ESTIMATE:
+        if self.regex is not None:
             return None
         if self.limit is not None:
             return min(self.total_estimate, self.limit)
@@ -1693,7 +1734,8 @@ def _dedup_stage(words: Iterator[str], cfg: _RunConfig) -> Iterator[str]:
             remedies.append("use --no-dedup to stream without dropping anything")
             options = "".join(f"\n  - {remedy}" for remedy in remedies)
             raise _CliError(
-                f"approximate deduplication of ~{cfg.dedup_capacity:,} words at a "
+                f"approximate deduplication of ~{_format_count(cfg.dedup_capacity)} "
+                f"words at a "
                 f"false-positive rate of {cfg.dedup_error:.2g} needs more than the "
                 f"{_human_bytes(_BLOOM_MAX_BYTES)} ceiling allows. The best rate "
                 f"within it is {plan.error_rate:.2g}, which would silently drop a "
@@ -1714,7 +1756,8 @@ def _dedup_stage(words: Iterator[str], cfg: _RunConfig) -> Iterator[str]:
         )
     if cfg.total_estimate > _DEDUP_WARN_THRESHOLD:
         print(
-            f"Warning: deduplicating ~{cfg.total_estimate:,} words holds them all in "
+            f"Warning: deduplicating ~{_format_count(cfg.total_estimate)} words "
+            f"holds them all in "
             f"memory (roughly {_human_bytes(cfg.total_estimate * _BYTES_PER_WORD)}). "
             f"Use --dedup-approx for bounded memory, or --no-dedup to stream.",
             file=sys.stderr,
@@ -1758,6 +1801,9 @@ def _build_pipeline(
     return words
 
 
+_PROGRESS_TOTAL_LIMIT = 10**18  # words; a run this long never finishes
+
+
 def _make_progress(cfg: _RunConfig) -> _ProgressBar | None:
     """Build a tqdm bar when tqdm is installed.
 
@@ -1775,8 +1821,15 @@ def _make_progress(cfg: _RunConfig) -> _ProgressBar | None:
     # disable=None is tqdm's own "only when my stream is a terminal" setting;
     # it writes to stderr, so a redirected stderr collects redraw spam without
     # it -- carriage returns and half-drawn bars in a log file.
+    #
+    # A total past _PROGRESS_TOTAL_LIMIT gets the counter too: tqdm does float
+    # arithmetic on it, which overflows past 1e308, and a run of that size
+    # could never reach a meaningful percentage anyway.
+    total = cfg.exact_output_count
+    if total is not None and total > _PROGRESS_TOTAL_LIMIT:
+        total = None
     bar: _ProgressBar = tqdm_mod.tqdm(
-        total=cfg.exact_output_count, unit="words", desc="Generating", disable=None
+        total=total, unit="words", desc="Generating", disable=None
     )
     return bar
 
@@ -2049,7 +2102,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if cfg.effective_scale > _FORCE_THRESHOLD and not args.force:
         print(
-            f"Warning: estimated {cfg.effective_scale:,} combinations. "
+            f"Warning: estimated {_format_count(cfg.effective_scale)} combinations. "
             f"Use --force to proceed.",
             file=sys.stderr,
         )

@@ -22,7 +22,6 @@ import pytest
 import bitbrew
 from bitbrew import (
     _BLOOM_MAX_BYTES,
-    _MAX_ESTIMATE,
     CHARSETS,
     _apply_filters,
     _BloomFilter,
@@ -901,11 +900,13 @@ class TestAuditFixes:
         assert "could not write" in capsys.readouterr().err
         assert not os.path.exists(outfile)
 
-    def test_estimate_count_capped(self) -> None:
-        """estimate_count should cap at _MAX_ESTIMATE for huge patterns."""
-        # 70^50 is astronomically large
-        result = estimate_count("*" * 50, 70)
-        assert result == _MAX_ESTIMATE
+    def test_estimate_count_is_exact_for_huge_patterns(self) -> None:
+        """Python integers are unbounded, so the estimate never needs a cap.
+
+        It used to clamp to 10**15, which made the public API return a wrong
+        number with nothing to say it had.
+        """
+        assert estimate_count("*" * 50, 70) == 70**50
 
     def test_redos_with_char_class(self) -> None:
         """ReDoS checker should catch nested quantifiers with character classes."""
@@ -1086,22 +1087,29 @@ class TestProgressTotal:
         assert main(["-p", "a*", "-p", "b*", "--charset", "xy", "-o", out]) == 0
         assert _FakeTqdm.last["total"] is None
 
-    def test_saturated_estimate_gets_no_total(self, tmp_path: "os.PathLike[str]") -> None:
-        """A capped estimate is not a real number; show a counter instead.
+    def test_large_exact_run_keeps_its_total(self, tmp_path: "os.PathLike[str]") -> None:
+        """Past the old 10**15 clamp the count is still exact, so the bar uses it.
 
-        The cap is reached for real rather than mocked: 70**16 combinations
-        saturate _MAX_ESTIMATE, and the estimate is arithmetic, so asking for
-        it costs nothing. _chunked_write is stubbed so the lazy pipeline is
-        never actually walked.
+        The estimate is arithmetic, so asking for it costs nothing;
+        _chunked_write is stubbed so the lazy pipeline is never walked.
         """
         out = os.path.join(str(tmp_path), "w.txt")
-        pattern = "*" * 16
         with mock.patch("bitbrew._chunked_write", return_value=0):
             assert main(
-                ["-p", pattern, "--charset", "all", "-o", out, "--force"]
+                ["-p", "*" * 11, "--charset", "lower", "-o", out, "--force"]
             ) == 0
+        assert _FakeTqdm.last["total"] == 26**11
 
-        assert estimate_count(pattern, len(resolve_charset("all"))) == _MAX_ESTIMATE
+    def test_astronomical_run_gets_a_counter(self, tmp_path: "os.PathLike[str]") -> None:
+        """tqdm does float arithmetic on its total, which overflows past 1e308.
+
+        A run that size cannot finish anyway, so a percentage carries nothing.
+        """
+        out = os.path.join(str(tmp_path), "w.txt")
+        with mock.patch("bitbrew._chunked_write", return_value=0):
+            assert main(
+                ["-p", "*" * 200, "--charset", "all", "-o", out, "--force"]
+            ) == 0
         assert _FakeTqdm.last["total"] is None
 
 
@@ -2977,3 +2985,71 @@ class TestInterruptDuringResolution:
         captured = capsys.readouterr()
         assert "Interrupted" in captured.err
         assert captured.out == ""
+
+
+class TestExactEstimates:
+    """Counts past the old 10**15 clamp must stay exact and must not crash.
+
+    The clamp made --count refuse a 26**11 space as if it needed --force and
+    quote 10**15 as the estimate. Lifting it exposes the float arithmetic the
+    estimate feeds, which overflows once an integer leaves float range.
+    """
+
+    def test_count_beyond_the_old_clamp_is_exact_and_free(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(["-p", "*" * 11, "--charset", "lower", "--count"])
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == str(26**11)
+
+    def test_count_of_exactly_the_old_clamp_is_answered(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """10**15 itself used to read as saturated, hence unknowable."""
+        ret = main(["-p", "*" * 15, "--charset", "digits", "--count"])
+        assert ret == 0
+        assert capsys.readouterr().out.strip() == str(10**15)
+
+    def test_force_warning_quotes_the_real_estimate(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(["-p", "*" * 11, "--charset", "lower"])
+        assert ret == 1
+        assert f"estimated {26**11:,} combinations" in capsys.readouterr().err
+
+    def test_astronomical_estimate_is_shown_in_scientific_notation(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(["-p", "*" * 200, "--charset", "all"])
+        assert ret == 1
+        exponent = len(str(70**200)) - 1
+        leading = str(70**200)[:3]
+        expected = f"{leading[0]}.{leading[1:]}e+{exponent}"
+        assert f"estimated {expected} combinations" in capsys.readouterr().err
+
+    def test_astronomical_exact_dedup_warns_without_crashing(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with mock.patch("bitbrew._chunked_write", return_value=0), \
+             mock.patch.object(sys, "stdout", _RecordingStdout(tty=False)):
+            ret = main(["-p", "*" * 200, "-p", "x", "--charset", "all", "--force"])
+        assert ret == 0
+        assert "holds them all in memory" in capsys.readouterr().err
+
+    def test_astronomical_approx_dedup_is_refused_cleanly(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(
+            ["-p", "*" * 200, "-p", "x", "--charset", "all", "--force", "--dedup-approx"]
+        )
+        assert ret == 1
+        assert "ceiling" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ("count", "shown"),
+        [(0, "0"), (999, "999"), (26**11, "3,670,344,486,987,776"),
+         (10**21, "1.00e+21"), (10**21 - 1, "999,999,999,999,999,999,999"),
+         (70**50, "1.79e+92")],
+    )
+    def test_format_count(self, count: int, shown: str) -> None:
+        assert bitbrew._format_count(count) == shown
