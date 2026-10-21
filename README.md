@@ -329,7 +329,8 @@ what you are about to generate. Each extra `*` multiplies the output by the char
 `-p "******"` over `lower` is 308 million words and roughly 2 GB of text.
 
 Control the streaming buffer size with `--chunk-size` (default: 10,000 words). It applies
-to every destination — a file, gzip, or stdout:
+to every destination — a file, gzip, or stdout — and is capped at 100,000, past which a
+bigger block only holds more of the wordlist in memory without writing it any faster:
 
 ```bash
 bitbrew -p "*****" --charset lower --force -o big.txt --chunk-size 50000
@@ -442,7 +443,7 @@ usage: bitbrew [-h] [--version] -p PATTERN [-o OUTPUT] [--charset CHARSET]
 | `--limit` | Stop after N words |
 | `--count` | Print word count only — no words emitted; `-o` is ignored |
 | `--compress` | Write gzip-compressed output |
-| `--chunk-size` | Words per streaming chunk (default: `10000`) |
+| `--chunk-size` | Words per streaming chunk (default: `10000`, at most `100000`) |
 | `--force` | Allow >10 M combinations |
 | `--overwrite` | Overwrite an existing output file |
 | `--allow-unsafe-regex` | Skip `--filter` safety screening |

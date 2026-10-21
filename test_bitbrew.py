@@ -2367,6 +2367,24 @@ class TestChunkedWritePolling:
         assert total == 25_000
         assert len(writes) == 1
 
+    def test_requested_chunk_size_is_capped(self) -> None:
+        """--chunk-size 20000000 used to hold 20M words at once: 795 MB of RSS.
+
+        Past _MAX_CHUNK larger blocks only cost memory -- the destination
+        buffers the writes back together -- so the block stops growing there.
+        """
+        buf = io.StringIO()
+        writes: list[str] = []
+        with mock.patch.object(
+            buf, "write", lambda data: (writes.append(data), len(data))[1]
+        ):
+            total = _chunked_write(
+                (f"w{i}" for i in range(250_000)), buf, chunk_size=10**9
+            )
+
+        assert total == 250_000
+        assert [chunk.count("\n") for chunk in writes] == [100_000, 100_000, 50_000]
+
 
 class TestFilterStageBypass:
     """An unconfigured filter stage is a generator resumed once per word."""
