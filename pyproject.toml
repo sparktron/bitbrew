@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "A CLI tool that generates wordlists by expanding patterns with wildcard substitution."
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 [project.optional-dependencies]
 progress = ["tqdm"]
@@ -34,7 +34,7 @@ fail_under = 93
 show_missing = true
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 strict = true
 files = ["bitbrew.py"]
 
@@ -45,7 +45,7 @@ ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]

@@ -2,7 +2,7 @@
 
 > **Pattern-based wordlist generator** — brew your wordlists one wildcard at a time.
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Tests](https://img.shields.io/badge/tests-pytest-green.svg)](https://docs.pytest.org/)
 
@@ -27,7 +27,7 @@
 
 ## 📦 Installation
 
-Requires **Python 3.10+**.
+Requires **Python 3.11+**.
 
 ```bash
 # Clone the repository
@@ -462,7 +462,7 @@ python -m pytest -v
 
 Linting uses [ruff](https://docs.astral.sh/ruff/) and type-checking uses
 [mypy](https://mypy-lang.org/) in `--strict` mode. CI runs both alongside the test matrix
-on Python 3.10–3.13:
+on Python 3.11–3.14:
 
 ```bash
 ruff check .
