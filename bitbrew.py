@@ -28,6 +28,7 @@ import os
 import re
 import secrets
 import signal
+import stat
 import sys
 import time
 from collections.abc import Callable, Generator, Iterable, Iterator
@@ -135,7 +136,9 @@ def load_charset_file(path: str) -> str:
 
     Unlike --charset, nothing is split or stripped, so commas and spaces can be
     part of the charset. A single trailing newline is ignored, since almost
-    every editor adds one.
+    every editor adds one, and so is a UTF-8 byte order mark. Newlines are
+    read untranslated: universal-newline mode would turn a lone "\\r" into
+    "\\n" before the caller could see it.
 
     Args:
         path: File to read.
@@ -146,7 +149,7 @@ def load_charset_file(path: str) -> str:
     Raises:
         OSError: If the file cannot be read.
     """
-    with open(path, encoding="utf-8") as handle:
+    with open(path, encoding="utf-8-sig", newline="") as handle:
         data = handle.read()
     if data.endswith("\r\n"):
         data = data[:-2]
@@ -155,7 +158,6 @@ def load_charset_file(path: str) -> str:
     return _dedupe_chars(data)
 
 
-_MAX_ESTIMATE = 10**15  # cap to prevent unbounded memory/time
 _DEDUP_WARN_THRESHOLD = 1_000_000  # warn above this when dedup is in play
 _BYTES_PER_WORD = 100  # measured cost of holding one short word in a set
 
@@ -172,14 +174,14 @@ def _count_from_kinds(kinds: Iterable[str], charset_len: int) -> int:
         charset_len: Number of characters in the active charset.
 
     Returns:
-        Word count (capped at _MAX_ESTIMATE).
+        The exact word count. Python integers are unbounded and this is one
+        multiply per wildcard, so there is nothing to gain from a cap -- the
+        one this used to apply made counts past 10**15 silently wrong.
     """
     count = 1
     for kind in kinds:
         # "?" has one extra option: matching nothing at all.
         count *= charset_len if kind == "*" else charset_len + 1
-        if count > _MAX_ESTIMATE:
-            return _MAX_ESTIMATE
     return count
 
 
@@ -191,7 +193,7 @@ def estimate_count(pattern: str, charset_len: int) -> int:
         charset_len: Number of characters in the active charset.
 
     Returns:
-        Estimated word count (capped at _MAX_ESTIMATE).
+        The number of candidates the pattern expands to, exactly.
 
     Raises:
         ValueError: If the pattern ends with a dangling backslash.
@@ -303,7 +305,13 @@ def _expand_pattern(pattern: str, chars: str) -> Generator[str, None, None]:
 # inputs long before any single match becomes slow. Probing bails the moment
 # the cumulative budget is spent, which bounds the cost of screening a
 # genuinely pathological pattern.
-_PROBE_LENGTHS = tuple(range(8, 41, 2))
+#
+# The budget is only consulted between searches, so the ladder starts short and
+# climbs one character at a time: a single search can then overshoot it by at
+# most one step's growth factor. Starting at eight characters made the first
+# search alone cost branches**8 steps -- a minute for (a|a|...|a)+$ with
+# fourteen branches -- before the budget was ever checked.
+_PROBE_LENGTHS = tuple(range(1, 41))
 _PROBE_BUDGET = 0.05  # seconds of cumulative match time before we call it unsafe
 _PROBE_MAX_SEEDS = 4
 
@@ -532,8 +540,74 @@ def _probe_seeds(pattern: str) -> list[str]:
     return seeds
 
 
+# Zero-width escapes: they constrain where a match sits but consume nothing,
+# so a prefix scan steps over them.
+_ZERO_WIDTH_ESCAPES = frozenset("AbBZ")
+
+
+def _probe_prefix(pattern: str) -> str:
+    """Spell out the literal text a pattern requires before anything repeats.
+
+    Probes built from a repeated seed alone fail on their first character
+    against a pattern such as "^pass(\\d|\\d)+$", which never reaches its
+    vulnerable group and so screens as safe. Prefixing the probes with text
+    the pattern demands up front gets them there.
+
+    The scan stops at the first construct it cannot turn into one definite
+    character: a group, a negated class, ".", an alternation, a backreference.
+    An element marked "*" or "?" is optional, so the scan stops before it; one
+    marked "+" or with a brace count is required, so it is spelled once and
+    the scan stops after it.
+
+    Args:
+        pattern: The raw regex source.
+
+    Returns:
+        The required leading text, or "" when there is none to find.
+    """
+    prefix: list[str] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "^":
+            index += 1
+            continue
+        if char == "\\":
+            following = pattern[index + 1] if index + 1 < len(pattern) else ""
+            index += 2
+            if following in _ZERO_WIDTH_ESCAPES:
+                continue
+            if following in _CLASS_MEMBERS:
+                unit = _CLASS_MEMBERS[following]
+            elif following and not following.isalnum():
+                unit = following
+            else:
+                break
+        elif char == "[":
+            members, index = _class_members(pattern, index)
+            if not members:
+                break
+            unit = members[0]
+        elif char in _METACHARACTERS:
+            break
+        else:
+            unit = char
+            index += 1
+        quantifier = pattern[index] if index < len(pattern) else ""
+        if quantifier in ("*", "?"):
+            break
+        prefix.append(unit)
+        if quantifier in ("+", "{"):
+            break
+    return "".join(prefix)
+
+
 def _probe_regex_blowup(regex: "re.Pattern[str]", pattern: str) -> str | None:
     """Time a compiled regex against growing adversarial inputs.
+
+    Each rung is tried bare and, when the pattern demands leading text, behind
+    that text as well. The bare form still matters: a top-level alternation
+    can make the "required" prefix belong to only one of its branches.
 
     Args:
         regex: The compiled pattern.
@@ -543,18 +617,21 @@ def _probe_regex_blowup(regex: "re.Pattern[str]", pattern: str) -> str | None:
         An error message if matching blows up, or None if it stays fast.
     """
     seeds = _probe_seeds(pattern)
+    prefix = _probe_prefix(pattern)
+    heads = ("", prefix) if prefix else ("",)
     spent = 0.0
     for length in _PROBE_LENGTHS:
-        for seed in seeds:
-            probe = (seed * (length // len(seed) + 1))[:length] + "\x00"
-            start = time.perf_counter()
-            regex.search(probe)
-            spent += time.perf_counter() - start
-            if spent > _PROBE_BUDGET:
-                return (
-                    f"matching took {spent * 1000:.0f} ms on a {length}-character "
-                    f"input, which indicates catastrophic backtracking (ReDoS)"
-                )
+        for head in heads:
+            for seed in seeds:
+                probe = head + (seed * (length // len(seed) + 1))[:length]
+                start = time.perf_counter()
+                regex.search(probe + "\x00")
+                spent += time.perf_counter() - start
+                if spent > _PROBE_BUDGET:
+                    return (
+                        f"matching took {spent * 1000:.0f} ms on a {len(probe)}-character "
+                        f"input, which indicates catastrophic backtracking (ReDoS)"
+                    )
     return None
 
 
@@ -627,6 +704,9 @@ def _text_writer(file_obj: "gzip.GzipFile | _TextSink") -> Callable[[str], None]
 
 
 _STOP_CHECK_INTERVAL = 10_000  # words between should_stop() polls
+# Largest block _chunked_write collects. Past this a bigger block only costs
+# memory -- a 20M-word chunk held 795 MB -- and measures slower, not faster.
+_MAX_CHUNK = 100_000
 
 
 @contextlib.contextmanager
@@ -709,7 +789,7 @@ def _chunked_write(
     Args:
         words: Word iterable.
         file_obj: File object to write to (text-mode or binary gzip).
-        chunk_size: Number of words per chunk.
+        chunk_size: Number of words per chunk, capped at _MAX_CHUNK.
         progress: Optional tqdm progress bar to update.
         should_stop: Optional predicate polled once per chunk. When it returns
             True the write is abandoned. While it is installed, chunks are
@@ -725,7 +805,7 @@ def _chunked_write(
     """
     write = _text_writer(file_obj)
     stream = iter(words)
-    block = chunk_size if should_stop is None else min(chunk_size, _STOP_CHECK_INTERVAL)
+    block = min(chunk_size, _MAX_CHUNK if should_stop is None else _STOP_CHECK_INTERVAL)
     total = 0
     while True:
         chunk = list(itertools.islice(stream, block))
@@ -766,6 +846,37 @@ def _needs_dedup(patterns: list[str]) -> bool:
     return "?" in _parse_pattern(patterns[0])[1]
 
 
+# Counts from here up are shown in scientific notation: a 22-digit figure
+# with separators is no easier to read than its order of magnitude.
+_PLAIN_COUNT_LIMIT = 10**21
+
+
+def _format_count(count: int) -> str:
+    """Format a word count for a message, however large it is.
+
+    Estimates are exact integers and can run to hundreds of digits. Converting
+    one to a float for "{:.2e}" overflows past 1e308, so the scientific form
+    is built with integer arithmetic instead.
+
+    Args:
+        count: A non-negative count.
+
+    Returns:
+        "3,670,344,486,987,776" below _PLAIN_COUNT_LIMIT, else a truncated
+        three-significant-figure form such as "1.79e+92".
+    """
+    if count < _PLAIN_COUNT_LIMIT:
+        return f"{count:,}"
+    exponent = int(math.log10(count))
+    # log10 returns a float, which can land one off right at a power of ten.
+    if 10**exponent > count:
+        exponent -= 1
+    elif 10 ** (exponent + 1) <= count:
+        exponent += 1
+    leading = count // 10 ** (exponent - 2)
+    return f"{leading // 100}.{leading % 100:02d}e+{exponent}"
+
+
 def _human_bytes(size: float) -> str:
     """Format a byte count using the largest unit that keeps it readable.
 
@@ -773,8 +884,12 @@ def _human_bytes(size: float) -> str:
         size: Number of bytes.
 
     Returns:
-        A string such as "95.4 MiB".
+        A string such as "95.4 MiB", or "over 1 PiB" past that. Exact
+        estimates make the sizes being formatted unbounded, and dividing an
+        integer past float range raises rather than rounding.
     """
+    if size >= 1024**5:
+        return "over 1 PiB"
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
         if size < 1024 or unit == "TiB":
             return f"{size:.1f} {unit}"
@@ -890,8 +1005,63 @@ def _place_output(temp_path: str, output_path: str, overwrite: bool) -> None:
     _remove_if_exists(temp_path)
 
 
+def _open_output(output_path: str) -> tuple[int, str | None, str]:
+    """Open the destination the way its file type calls for.
+
+    Placement renames a sidecar over the target, which replaces the directory
+    entry whatever it was. That is the point for a regular file and wrong for
+    everything else: as root, `-o /dev/null --overwrite` would swap the system
+    /dev/null for a regular file, and a FIFO's reader would never see a word.
+    A character device or a FIFO is therefore written directly, the way a
+    shell redirect would. A symlink is resolved once, here, so the link
+    survives and its target is what gets replaced; resolving it again at
+    placement would let a link planted mid-run redirect the write.
+
+    An existing file's permission bits are copied onto the sidecar before any
+    word is written, so a wordlist kept at 0600 neither comes back at the
+    umask default nor sits wider than that while the run is in progress.
+    Ownership cannot be carried over without privilege and is not attempted.
+
+    Args:
+        output_path: The -o value.
+
+    Returns:
+        (handle, temp_path, target). temp_path is the sidecar to place onto
+        target once the run completes, or None when handle writes to the
+        target directly.
+
+    Raises:
+        OSError: If the target cannot be opened, or is a file type that cannot
+            hold a wordlist, such as a directory or a block device.
+    """
+    target = os.path.realpath(output_path)
+    try:
+        existing: os.stat_result | None = os.stat(target)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        if stat.S_ISCHR(existing.st_mode) or stat.S_ISFIFO(existing.st_mode):
+            return os.open(target, os.O_WRONLY), None, target
+        raise OSError(
+            f"'{output_path}' is not a regular file, character device or FIFO"
+        )
+    handle, temp_path = _create_sidecar(target)
+    if existing is not None:
+        try:
+            os.chmod(temp_path, stat.S_IMODE(existing.st_mode))
+        except OSError:
+            os.close(handle)
+            _remove_if_exists(temp_path)
+            raise
+    return handle, temp_path, target
+
+
 _FORCE_THRESHOLD = 10_000_000  # combinations above which --force is required
 _BLOOM_MAX_BYTES = 1 << 31  # 2 GiB ceiling on the approximate-dedup filter
+
+
+# Past this many items no filter of any feasible size has a useful error rate.
+_PLAN_CAPACITY_LIMIT = 10**18
 
 
 class _BloomSizing(NamedTuple):
@@ -923,7 +1093,10 @@ def _plan_bloom(capacity: int, error_rate: float, max_bytes: int) -> _BloomSizin
         The bit count, probe count, and the rate actually achieved -- which is
         worse than requested whenever the ceiling binds.
     """
-    capacity = max(1, capacity)
+    # Clamped for the float arithmetic below, which overflows past 1e308. Any
+    # budget a machine could hold is long saturated by this point, so the plan
+    # -- error rate pinned at 1, and the run refused -- comes out the same.
+    capacity = max(1, min(capacity, _PLAN_CAPACITY_LIMIT))
     # The familiar continuous Bloom formula can undersize by a small amount
     # once the number of probes is rounded to an integer. Solve the formula for
     # the two neighbouring integer probe counts so an uncapped plan actually
@@ -1171,14 +1344,14 @@ class _RunConfig:
         """The output size, when it is knowable without generating anything.
 
         Returns:
-            The exact number of words the run will emit, or None when filters,
-            deduplication, or a saturated estimate make it unknowable.
+            The exact number of words the run will emit, or None when filters
+            or deduplication make it unknowable.
         """
         if self.dedup != "none":
             return None
         if self.min_len is not None or self.max_len is not None:
             return None
-        if self.regex is not None or self.total_estimate >= _MAX_ESTIMATE:
+        if self.regex is not None:
             return None
         if self.limit is not None:
             return min(self.total_estimate, self.limit)
@@ -1227,7 +1400,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compress", action="store_true", help="Write output as .gz.")
     parser.add_argument(
         "--chunk-size", type=int, default=10000,
-        help="Stream output N words at a time (default: 10000).",
+        help="Stream output N words at a time (default: 10000, at most 100000).",
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -1276,7 +1449,9 @@ def _resolve_charset_option(args: argparse.Namespace) -> str:
             raise _CliError("--charset and --charset-file are mutually exclusive.")
         try:
             return load_charset_file(args.charset_file)
-        except OSError as exc:
+        # A file that is not UTF-8 fails in the codec, not the OS, and
+        # UnicodeDecodeError is a ValueError.
+        except (OSError, UnicodeDecodeError) as exc:
             raise _CliError(
                 f"could not read --charset-file '{args.charset_file}': {exc}"
             ) from exc
@@ -1348,6 +1523,91 @@ def _resolve_dedup_option(args: argparse.Namespace) -> str:
     return "approx" if args.dedup_approx else "exact"
 
 
+def _unencodable(text: str, encoding: str) -> str | None:
+    """Find the first character an encoding cannot represent.
+
+    Args:
+        text: The text that will be written.
+        encoding: The destination's codec.
+
+    Returns:
+        The offending character, or None when all of text encodes.
+    """
+    try:
+        text.encode(encoding)
+    except UnicodeEncodeError as exc:
+        return text[exc.start]
+    return None
+
+
+def _check_line_breaks(charset: str, patterns: list[str], from_file: bool) -> None:
+    """Refuse input that would put a line break inside a word.
+
+    The output is one word per line. A newline in the charset or a pattern
+    splits every word holding it across two lines, which corrupts the wordlist
+    without any error -- most often from an editor leaving a blank line at the
+    end of a --charset-file. A carriage return is refused too: line-oriented
+    readers commonly treat it as a terminator.
+
+    Args:
+        charset: The resolved charset.
+        patterns: The patterns as given.
+        from_file: Whether the charset came from --charset-file.
+
+    Raises:
+        _CliError: If any of them holds "\\n" or "\\r".
+    """
+    hint = " Is there a blank line at the end of the file?" if from_file else ""
+    sources = [("the charset", charset, hint)]
+    sources += [(f"pattern {pattern!r}", pattern, "") for pattern in patterns]
+    for name, text, extra in sources:
+        for char in "\n\r":
+            if char in text:
+                raise _CliError(
+                    f"{name} contains a line break ({char!r}), which would split "
+                    f"every word holding it across two lines of output.{extra}"
+                )
+
+
+def _check_encodable(charset: str, patterns: list[str], text_stdout: bool) -> None:
+    """Refuse input the destination cannot encode, before anything is written.
+
+    Bytes on the command line that are not valid UTF-8 reach Python as lone
+    surrogates, which no strict codec accepts, and a stdout in a narrow
+    encoding rejects whatever falls outside it. Found mid-write, either one
+    escaped as a UnicodeEncodeError traceback -- a ValueError, which none of
+    the write paths' OSError handlers catch -- and left the -o sidecar behind.
+
+    Args:
+        charset: The resolved charset.
+        patterns: The patterns as given.
+        text_stdout: Whether words go to stdout as text, through its codec.
+            Files and --compress output are always UTF-8.
+
+    Raises:
+        _CliError: If some character cannot be written.
+    """
+    sources = [("the charset", charset)]
+    sources += [(f"pattern {pattern!r}", pattern) for pattern in patterns]
+    for name, text in sources:
+        char = _unencodable(text, "utf-8")
+        if char is not None:
+            raise _CliError(
+                f"{name} contains {char!r}, which is not valid UTF-8. Bytes on the "
+                f"command line that do not decode as UTF-8 arrive this way."
+            )
+    encoding = getattr(sys.stdout, "encoding", None) if text_stdout else None
+    if not encoding:
+        return
+    for _, text in sources:
+        char = _unencodable(text, encoding)
+        if char is not None:
+            raise _CliError(
+                f"stdout encoding '{encoding}' cannot represent {char!r}. Write "
+                f"with -o, which is always UTF-8, or set PYTHONIOENCODING=utf-8."
+            )
+
+
 def _resolve_options(args: argparse.Namespace) -> _RunConfig:
     """Validate arguments and resolve them into a run configuration.
 
@@ -1395,7 +1655,16 @@ def _resolve_options(args: argparse.Namespace) -> _RunConfig:
             )
         total_estimate += _count_from_kinds(kinds, len(charset))
 
+    _check_line_breaks(charset, args.pattern, from_file=args.charset_file is not None)
+
     output_path = args.output
+    use_compress = args.compress or bool(output_path and output_path.endswith(".gz"))
+    _check_encodable(
+        charset,
+        args.pattern,
+        text_stdout=not output_path and not use_compress and not args.count,
+    )
+
     # --count prints to stdout and never opens the output path, so validating
     # it would refuse runs that cannot touch a file: `--count -o existing.txt`
     # asked about a write that is not going to happen.
@@ -1426,7 +1695,7 @@ def _resolve_options(args: argparse.Namespace) -> _RunConfig:
         limit=args.limit,
         chunk_size=args.chunk_size,
         output_path=output_path,
-        use_compress=args.compress or bool(output_path and output_path.endswith(".gz")),
+        use_compress=use_compress,
         overwrite=args.overwrite,
         dedup=_resolve_dedup_option(args),
         dedup_error=args.dedup_error,
@@ -1468,7 +1737,8 @@ def _dedup_stage(words: Iterator[str], cfg: _RunConfig) -> Iterator[str]:
             remedies.append("use --no-dedup to stream without dropping anything")
             options = "".join(f"\n  - {remedy}" for remedy in remedies)
             raise _CliError(
-                f"approximate deduplication of ~{cfg.dedup_capacity:,} words at a "
+                f"approximate deduplication of ~{_format_count(cfg.dedup_capacity)} "
+                f"words at a "
                 f"false-positive rate of {cfg.dedup_error:.2g} needs more than the "
                 f"{_human_bytes(_BLOOM_MAX_BYTES)} ceiling allows. The best rate "
                 f"within it is {plan.error_rate:.2g}, which would silently drop a "
@@ -1487,10 +1757,13 @@ def _dedup_stage(words: Iterator[str], cfg: _RunConfig) -> Iterator[str]:
                 cfg.dedup_capacity, cfg.dedup_error, _BLOOM_MAX_BYTES, plan=plan
             ),
         )
-    if cfg.total_estimate > _DEDUP_WARN_THRESHOLD:
+    # dedup_capacity, not the full estimate: --limit caps what the set can
+    # ever hold, exactly as it caps what the Bloom filter is sized for.
+    held = cfg.dedup_capacity
+    if held > _DEDUP_WARN_THRESHOLD:
         print(
-            f"Warning: deduplicating ~{cfg.total_estimate:,} words holds them all in "
-            f"memory (roughly {_human_bytes(cfg.total_estimate * _BYTES_PER_WORD)}). "
+            f"Warning: deduplicating ~{_format_count(held)} words holds them all in "
+            f"memory (roughly {_human_bytes(held * _BYTES_PER_WORD)}). "
             f"Use --dedup-approx for bounded memory, or --no-dedup to stream.",
             file=sys.stderr,
         )
@@ -1533,6 +1806,9 @@ def _build_pipeline(
     return words
 
 
+_PROGRESS_TOTAL_LIMIT = 10**18  # words; a run this long never finishes
+
+
 def _make_progress(cfg: _RunConfig) -> _ProgressBar | None:
     """Build a tqdm bar when tqdm is installed.
 
@@ -1550,8 +1826,15 @@ def _make_progress(cfg: _RunConfig) -> _ProgressBar | None:
     # disable=None is tqdm's own "only when my stream is a terminal" setting;
     # it writes to stderr, so a redirected stderr collects redraw spam without
     # it -- carriage returns and half-drawn bars in a log file.
+    #
+    # A total past _PROGRESS_TOTAL_LIMIT gets the counter too: tqdm does float
+    # arithmetic on it, which overflows past 1e308, and a run of that size
+    # could never reach a meaningful percentage anyway.
+    total = cfg.exact_output_count
+    if total is not None and total > _PROGRESS_TOTAL_LIMIT:
+        total = None
     bar: _ProgressBar = tqdm_mod.tqdm(
-        total=cfg.exact_output_count, unit="words", desc="Generating", disable=None
+        total=total, unit="words", desc="Generating", disable=None
     )
     return bar
 
@@ -1579,9 +1862,11 @@ def _write_to_file(
     # unrelated leftover file, and two concurrent runs would corrupt each other.
     temp_path: str | None = None
     progress: _ProgressBar | None = None
+    in_place = False
     try:
         progress = _make_progress(cfg)
-        handle, temp_path = _create_sidecar(output_path)
+        handle, temp_path, target = _open_output(output_path)
+        in_place = temp_path is None
         if cfg.use_compress:
             with (
                 os.fdopen(handle, "wb") as raw,
@@ -1603,18 +1888,20 @@ def _write_to_file(
         if should_stop():
             raise KeyboardInterrupt
 
-        _place_output(temp_path, output_path, cfg.overwrite)
+        if temp_path is not None:
+            _place_output(temp_path, target, cfg.overwrite)
+            # Placed: the sidecar is gone or is now the output itself.
+            temp_path = None
         print(f"Wrote {written:,} words to {output_path}", file=sys.stderr)
     except KeyboardInterrupt:
-        if temp_path is not None:
-            _remove_if_exists(temp_path)
-        print("\nInterrupted. Partial output file removed.", file=sys.stderr)
+        if in_place:
+            print("\nInterrupted.", file=sys.stderr)
+        else:
+            print("\nInterrupted. Partial output file removed.", file=sys.stderr)
         return 130
     except FileExistsError:
         # The output appeared after the resolve-time guard: a concurrent run,
         # or a file dropped in between. Refuse it the way the guard would have.
-        if temp_path is not None:
-            _remove_if_exists(temp_path)
         print(
             f"Error: output file '{output_path}' already exists. "
             f"Use --overwrite to replace.",
@@ -1622,11 +1909,13 @@ def _write_to_file(
         )
         return 1
     except OSError as exc:
-        if temp_path is not None:
-            _remove_if_exists(temp_path)
         print(f"Error: could not write to '{output_path}': {exc}", file=sys.stderr)
         return 1
     finally:
+        # Here rather than in each handler, so a failure none of them names --
+        # or an interrupt landing inside one -- still removes the sidecar.
+        if temp_path is not None:
+            _remove_if_exists(temp_path)
         if progress is not None:
             progress.close()
     return 0
@@ -1802,6 +2091,11 @@ def main(argv: list[str] | None = None) -> int:
     except _CliError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        # Resolution screens --filter, which can take a moment, and runs
+        # before the interrupt guard exists. Exit the way the guarded run does.
+        print("\nInterrupted.", file=sys.stderr)
+        return 130
 
     # Counting is free when nothing can drop a word, so answer before the
     # scale guard: previewing a huge pattern should not need --force.
@@ -1813,7 +2107,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if cfg.effective_scale > _FORCE_THRESHOLD and not args.force:
         print(
-            f"Warning: estimated {cfg.effective_scale:,} combinations. "
+            f"Warning: estimated {_format_count(cfg.effective_scale)} combinations. "
             f"Use --force to proceed.",
             file=sys.stderr,
         )

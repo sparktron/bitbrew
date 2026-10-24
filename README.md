@@ -2,7 +2,7 @@
 
 > **Pattern-based wordlist generator** — brew your wordlists one wildcard at a time.
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Tests](https://img.shields.io/badge/tests-pytest-green.svg)](https://docs.pytest.org/)
 
@@ -27,7 +27,7 @@
 
 ## 📦 Installation
 
-Requires **Python 3.10+**.
+Requires **Python 3.11+**.
 
 ```bash
 # Clone the repository
@@ -134,12 +134,17 @@ It is a warning, not a rejection — a raw charset is allowed to look like anyth
 
 **Commas and spaces** cannot be expressed through `--charset`, since it splits on commas
 and trims whitespace. Use `--charset-file` to supply a charset verbatim — every character
-in the file is used as-is, apart from a single trailing newline:
+in the file is used as-is, apart from a single trailing newline (`\n` or `\r\n`) and a UTF-8
+byte order mark:
 
 ```bash
 printf 'abc, ' > charset.txt
 bitbrew -p "**" --charset-file charset.txt
 ```
+
+The one thing a charset or pattern cannot hold is a line break. Output is one word per line,
+so a `\n` or `\r` inside a word would split it across two lines. bitbrew refuses it instead,
+which most often catches a blank line left at the end of a charset file.
 
 ---
 
@@ -193,15 +198,20 @@ two ways before generating anything:
    structural check sees. The alphabet is what the pattern *matches*, not the characters
    of its source: `\s` contributes a space, `\d` a digit, and literal punctuation counts,
    so `(\s|\s)+$` is probed with whitespace rather than with the letter `s` it can never
-   consume.
+   consume. Literal text the pattern requires up front is spelled out ahead of each probe,
+   so an anchored filter such as `^pass(\d|\d)+$` is exercised past its `pass` rather than
+   failing on the first character.
 
 The probe costs well under a millisecond for a normal filter and stops after a match pushes
-its cumulative work over the time budget. The structural pass itself is linear, including
-for malformed patterns; syntax errors are then reported by Python's regex compiler.
+its cumulative work over the time budget. Its inputs start one character long and grow one
+character at a time, so no single match can overshoot that budget by more than one step of
+growth: even a 30-way alternation is rejected in about a second. The structural pass itself
+is linear, including for malformed patterns; syntax errors are then reported by Python's
+regex compiler.
 
 ```bash
 $ bitbrew -p "***" --filter "(a|a)+$"
-Error: unsafe regex '(a|a)+$': matching took 176 ms on a 20-character input, which
+Error: unsafe regex '(a|a)+$': matching took 81 ms on an 18-character input, which
 indicates catastrophic backtracking (ReDoS). Use --allow-unsafe-regex to run it anyway.
 ```
 
@@ -319,7 +329,8 @@ what you are about to generate. Each extra `*` multiplies the output by the char
 `-p "******"` over `lower` is 308 million words and roughly 2 GB of text.
 
 Control the streaming buffer size with `--chunk-size` (default: 10,000 words). It applies
-to every destination — a file, gzip, or stdout:
+to every destination — a file, gzip, or stdout — and is capped at 100,000, past which a
+bigger block only holds more of the wordlist in memory without writing it any faster:
 
 ```bash
 bitbrew -p "*****" --charset lower --force -o big.txt --chunk-size 50000
@@ -353,8 +364,10 @@ that could never reach 100%.
 
 **Interrupted?** Pressing `Ctrl+C` stops generation promptly and exits with code `130`,
 whether the run is writing to a file, streaming to stdout, or counting. File output removes
-its partial file first. A run interrupted mid-`--compress` leaves a valid archive of however
-much it had finished, and the non-zero exit code tells you it is a prefix, not the whole list.
+its partial file first. A compressed stream to stdout cannot be taken back, and one
+interrupted mid-`--compress` is cut off inside the archive, so it will not decompress: bitbrew
+says so ("Compressed output is incomplete"), and the non-zero exit code is there so a script
+discards it rather than using it.
 
 **Atomic output:** bitbrew builds into a `<output>.<random>.part` sidecar and renames it into place
 only once the run completes. An interrupted or failed run — a full disk, a permissions
@@ -368,6 +381,12 @@ On filesystems with no hard links (FAT, some network mounts) there is no create-
 primitive, so the check is instead made immediately before the rename. The refusal is best-effort
 there rather than atomic — but the output path is still never created until the finished wordlist
 is what lands on it.
+
+Atomic placement applies to regular files only. A character device or FIFO named by `-o` is
+written into directly, the way a shell redirect would, so `-o /dev/null --overwrite` never
+replaces the device node. A symlink is followed: the link stays, and its target is what gets
+replaced. Overwriting an existing file keeps its permission bits (a `0600` wordlist stays
+`0600`), but not its owner. A directory or any other file type is refused.
 
 ---
 
@@ -426,7 +445,7 @@ usage: bitbrew [-h] [--version] -p PATTERN [-o OUTPUT] [--charset CHARSET]
 | `--limit` | Stop after N words |
 | `--count` | Print word count only — no words emitted; `-o` is ignored |
 | `--compress` | Write gzip-compressed output |
-| `--chunk-size` | Words per streaming chunk (default: `10000`) |
+| `--chunk-size` | Words per streaming chunk (default: `10000`, at most `100000`) |
 | `--force` | Allow >10 M combinations |
 | `--overwrite` | Overwrite an existing output file |
 | `--allow-unsafe-regex` | Skip `--filter` safety screening |
@@ -446,7 +465,7 @@ python -m pytest -v
 
 Linting uses [ruff](https://docs.astral.sh/ruff/) and type-checking uses
 [mypy](https://mypy-lang.org/) in `--strict` mode. CI runs both alongside the test matrix
-on Python 3.10–3.13:
+on Python 3.11–3.14:
 
 ```bash
 ruff check .
